@@ -28,6 +28,13 @@ Prototype basé sur le fork modifié de **`VitaSync` 1.7** (licence MIT).
 > Le bouton de téléchargement du tutoriel récupère automatiquement le plugin
 > embarqué et le copie dans `Téléchargements`.
 
+## Dépannage vidéo
+
+Il arrive parfois que la vidéo ne démarre pas du premier coup. Dans ce cas,
+relancer la capture vidéo plusieurs fois (arrêter puis redémarrer) jusqu'à ce
+que l'image s'affiche. Ne pas hésiter à insister : c'est un comportement
+connu du prototype, l'image finit toujours par arriver.
+
 ## Compiler l'application Windows
 
 ```powershell

@@ -1,0 +1,25 @@
+# Visual Studio / .NET build outputs
+bin/
+obj/
+.vs/
+*.user
+*.suo
+TestResults/
+*.log
+
+# Vita plugin build artifacts (vita-udcd-uvc)
+vita-udcd-uvc/**/*.o
+vita-udcd-uvc/**/*.d
+vita-udcd-uvc/**/*.elf
+vita-udcd-uvc/**/*.velf
+vita-udcd-uvc/**/*.self
+vita-udcd-uvc/**/*.suprx
+vita-udcd-uvc/**/*.skprx
+vita-udcd-uvc/**/*.bin
+vita-udcd-uvc/**/*.map
+vita-udcd-uvc/build/
+vita-udcd-uvc/taiHEN/
+
+# OS clutter
+.DS_Store
+Thumbs.db

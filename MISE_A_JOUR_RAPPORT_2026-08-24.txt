@@ -1,0 +1,524 @@
+RAPPORT DE PROJET — VitaPCControl
+=====================================
+Date : 27/08/2026 — Version build 89 (audio désactivée) — RENOMMÉ VitaSync
+Dernière mise à jour du rapport : 27/08/2026 — session : renommage VitaSync, tutoriel d'installation, corrections vidéo/flèches/F11 (PHASE 15)
+
+===============================================================================
+OBJECTIF DE L'APPLICATION
+===============================================================================
+Créer une application Windows unique (`VitaSync.exe`) permettant de jouer
+à des jeux PS Vita entièrement depuis le PC, via un câble USB, sans WiFi.
+L'application doit combiner dans une seule fenêtre :
+- Affichage vidéo en temps réel de l'écran de la Vita (la Vita se comporte
+  comme une webcam USB standard — protocole UVC/USB Video Class).
+- Contrôle complet de la console : les touches du clavier et les mouvements/
+  clics de la souris du PC doivent être transmis à la Vita et interprétés
+  comme des appuis sur les boutons physiques et mouvements des joysticks
+  analogiques.
+- Émulation de l'écran tactile : clic souris sur l'image = pression tactile
+  à l'endroit exact sur la Vita.
+- Mode FPS : capture de la souris pour contrôler la caméra des jeux à la
+  première personne sans limitation par les bords de l'écran.
+
+ÉTAT ACTUEL : TOUTES CES FONCTIONNALITÉS SONT OPÉRATIONNELLES ✅
+Son : développé via vidéo NV12, craquements non résolus, DÉSACTIVÉ en build 89.
+Code audio conservé in situ, reactiver via les flags de compilation.
+
+===============================================================================
+ARCHITECTURE DU PROJET
+===============================================================================
+Le projet a deux composants qui communiquent via USB :
+
+1. PLUGIN KERNEL VITA — `VitaSync.skprx` (renommé depuis `udcd_uvc.skprx`)
+   Emplacement source : `vita-udcd-uvc/`
+   Base : fork modifié du projet open-source `xerpi/vita-udcd-uvc`
+   Compilation : VitaSDK installé dans `C:\Users\<user>\Desktop\vitasdk`
+   Commandes de build (dans MSYS2) :
+   ```bash
+   cd "/c/Users/<user>/Desktop/Développement app/VitaPCControl_USB_Prototype_01/vita-udcd-uvc"
+   export VITASDK=/c/Users/<user>/Desktop/vitasdk
+   export PATH=$VITASDK/bin:$PATH
+   make clean && make
+   ```
+   Fichier généré : `VitaSync.skprx` (13 907 octets) → copier sur la Vita dans `ur0:tai/`
+   Nom UVC du device : `VITASYNC` (UVC_DRIVER_NAME, max 15 caractères) — PID USB 0x1337
+   avec cette entrée dans `ur0:tai/config.txt` :
+   ```
+   *KERNEL
+   ur0:tai/VitaSync.skprx
+   ```
+   Puis redémarrage complet de la Vita.
+
+2. APPLICATION WINDOWS — `VitaSync.exe` (renommée depuis `VitaPCControl.exe`)
+   C#/.NET 8 WinForms, projet `VitaPCControl.csproj` (TFM net8.0-windows10.0.22621.0)
+   Bibliothèques : HidSharp (HID), Media Foundation (vidéo via WinRT), waveOut (audio)
+   Compilation (PowerShell) :
+   ```powershell
+   cd "C:\Users\<user>\Desktop\Développement app\VitaPCControl_USB_Prototype_01\windows"
+   dotnet build -c Release
+   ```
+   Exécutable : `windows\bin\Release\net8.0-windows10.0.22621.0\VitaSync.exe`
+   Réglages utilisateur : `%APPDATA%\VitaSync\` (keymap.txt, sensitivity.txt, lang.txt, tutoDone.txt)
+
+SAUVEGARDE STABLE
+-----------------
+Dossier : `C:\Users\<user>\Desktop\App backup\`
+Contient les binaires compilés de la dernière version validée par l'utilisateur.
+NE JAMAIS MODIFIER CE DOSSIER. Pour revenir en arrière : copier le skprx sur
+la Vita + lancer l'exe du dossier backup.
+
+===============================================================================
+MAPPING DES TOUCHES (FINAL)
+===============================================================================
+ZQSD          → Joystick gauche (déplacement)
+Souris (F8)   → Joystick droit (caméra)
+E             → △ Triangle
+R             → □ Carré
+Maj (Shift)   → ○ Rond
+Espace        → × Croix
+F1            → Gâchette L (généré aussi en alias L1=0x400 pour contournement fw)
+F2            → Gâchette R (généré aussi en alias R1=0x800 pour contournement fw)
+F3            → SELECT
+F4            → START
+Flèches       → Croix directionnelle (D-pad)
+F8            → Activer/désactiver le mode capture souris FPS
+Clic souris   → Pression tactile sur l'écran de la Vita (hors mode FPS)
+                (sur l'image vidéo uniquement, coordonnées mappées 1920×1088)
+
+===============================================================================
+HISTORIQUE COMPLET — PHASES 1 À 8 (session précédente)
+===============================================================================
+
+PHASE 1 — Mise en place de l'environnement (réussie)
+Installation de VitaSDK (channel `2026.08`, vdvm correctement placé).
+.NET SDK 8 via winget. OneDrive désactivé → chemin Bureau changé.
+
+PHASE 2 — Première compilation du plugin (réussie)
+Erreur `undefined reference to taiGetModuleInfoForKernel` → ajout
+`-ltaihenForKernel_stub` dans LIBS du Makefile. Résolu.
+
+PHASE 3 — Première compilation de l'app Windows (réussie)
+Bugs corrigés : Timer ambigu, HidSharp UsagePage absent, cast unchecked.
+
+PHASE 4 — Mapping clavier étendu (réussi)
+Flèches D-pad, Entrée→Start, Retour→Select ajoutés.
+
+PHASE 5 — Affichage vidéo ajouté (jamais testé à ce stade)
+AForge.Video/DirectShow ajoutés, PictureBox, StartVideo/StopVideo.
+
+PHASE 6 — Premier test matériel : Code 10 Windows (résolu)
+Interface HID non reconnue. Cause : numInterfaces resté à 2 au lieu de 3
+dans la structure SceUdcdInterface. Corrigé à 3.
+
+PHASE 7 — Crashes au démarrage de la Vita (résolus)
+Logging on-device causait des panics (écritures ux0: trop précoces).
+Abandon de tout logging fichier. Récupération : reboot avec L maintenu.
+
+PHASE 8 — Recherche du bug de contrôle (non résolu à ce stade)
+Quatre hypothèses testées, aucune ne résolvait le problème :
+- SET_REPORT EP0 non géré → ajouté, sans effet
+- Cache CPU non invalidé → ajouté, sans effet  
+- Durée d'émulation uiMake → appel continu en vblank, sans effet
+- Bug de reconnexion en boucle côté PC → corrigé (ProcessCmdKey)
+
+===============================================================================
+HISTORIQUE COMPLET — PHASES 9 À 14 (cette session)
+===============================================================================
+
+OUTIL CLÉ INTRODUIT : LE HEARTBEAT (rapport Input bidirectionnel)
+----------------------------------------------------------------
+Le canal HID Input (Vita → PC) a été utilisé comme canal de diagnostic.
+La Vita envoie toutes les 500ms un rapport contenant :
+- Compteurs de réception USB (recus, err)
+- État d'émulation actuel (act)
+- Boutons injectés (emu btns)
+- Manette physique vue par le système (PHYS btns + sticks)
+- Codes retour des fonctions ksceCtrlSet*Emulation (retBtn, retAna)
+- État du flux vidéo UVC (stream, fmt, frame, ivl)
+- État des hooks tactiles et compteurs par porte de lecture
+- Niveau du buffer audio
+CET OUTIL A PERMIS DE RÉSOUDRE TOUS LES BUGS SUIVANTS SANS JAMAIS AVOIR
+BESOIN DE DEBUGGER SUR LA CONSOLE.
+
+PHASE 9 — Résolution du bug de contrôle (les boutons ne marchaient pas)
+-----------------------------------------------------------------------
+Le mystère de la phase 8 est résolu. Il y avait QUATRE problèmes empilés :
+
+9.1  DÉSACCORD DE TAILLE DE RAPPORT HID (bloquant total).
+     Descripteur déclarait 16 octets de données + Report ID = 17 octets
+     câble. L'app envoyait 16 octets, la Vita recevait dans 16 octets.
+     Windows exige WriteFile == OutputReportByteLength EXACT.
+     → CORRECTION : alignement strict des 3 couches (descripteur /
+     tableau C# / buffer kernel). Le rapport fait maintenant 64 octets
+     total (1 Report ID + 63 data bytes).
+
+9.2  CACHE CPU PÉRIMÉ.
+     Après écriture DMA USB, le CPU relisait ses lignes de cache au lieu
+     de la RAM fraîche → il appliquait en boucle des zéros au lieu des
+     vraies valeurs. Symptôme : btns=000 sticks=0/0/0/0 malgré transport OK.
+     → CORRECTION : ksceKernelDcacheInvalidateRange(pc_hid_report, sizeof)
+     AVANT chaque lecture post-DMA.
+
+9.3  PAS DE RÉARMEMENT EN CAS D'ERREUR.
+     pc_hid_recv_on_complete retournait sans réarmer si returnCode<0,
+     tuant définitivement le canal après le premier accroc.
+     → CORRECTION : réarmement systématique même en cas d'erreur.
+
+9.4  BITS GÂCHETTES FILTRÉS PAR LE FIRMWARE.
+     Les bits L/R classiques (0x0100/0x0200) passent le transport mais
+     sont IGNORÉS par la fusion d'émulation du système (confirmé par
+     PHYS btns montrant l'injection sans effet en jeu).
+     → CONTOURNEMENT VALIDÉ : injecter aussi les alias matériels
+     L1/R1 (0x0400/0x0800) en plus des bits classiques.
+     Résultat : les gâchettes fonctionnent !
+
+9.5  SLOTS D'ÉMULATION SÉPARÉS.
+     L'analogique (slot 0) écrasait la partie boutons du même slot.
+     → Solution : analogique slot 0, boutons slots 1-3 combinés.
+
+9.6  DÉRIVE DU STICK corrigée.
+     Chaque console a un point de repos propre (~124 au lieu de 128).
+     Au branchement, le plugin mesure la position de repos réelle via
+     ksceCtrlPeekBufferPositive et exprime toutes les valeurs RELATIVEMENT
+     à ce neutre. Plus aucune dérive.
+
+PHASE 10 — LA SOURIS-CAMÉRA FPS
+-------------------------------
+- Problème des bords d'écran : curseur libre se coince aux limites.
+  Solution : mode capture (F8) — curseur caché, ClipCursor sur fenêtre,
+  recentrage continu au centre de la vignette.
+- Bug tremblements : SetCursorPos générait un mouvement inverse compté
+  comme réel. Correction : passage au RAW INPUT (WM_INPUT,
+  MOUSE_MOVE_RELATIVE) insensible au recentrage.
+- Fluidité : timeBeginPeriod(1) pour précision timer réelle,
+  envois à 1ms, lissage du stick droit (glide 70%/tick).
+- Sensibilité persistante (%AppData%\VitaPCControl\sensitivity.txt).
+- Valeur par défaut : 700 (point exact où le stick est à fond dès le
+  moindre mouvement).
+
+PHASE 11 — LE TACTILE (clic souris = pression à l'endroit exact)
+---------------------------------------------------------------
+Technique retenue : interception globale des lectures du pilote SceTouch
+(même approche que VitaControl/ds34vita) via taiHookFunctionExportForKernel
+avec KERNEL_PID et TAI_ANY_LIBRARY :
+  ksceTouchPeek      NID 0xBAD1960B
+  PeekRegion         NID 0x9B3F7207
+  Read               NID 0x70C8AACE
+  ReadRegion         NID 0x9A91F624
+  Peek2              NID 0x3AD3D0A1
+  Read2              NID 0x39401BEA
+Les rapports retournés au jeu sont réécrits avec notre doigt virtuel.
+
+Pièges découverts et corrigés (À NE JAMAIS REFAIRE) :
+11.1  Ne JAMAIS mettre tout le tampon SceTouchData à zéro. Conserver
+      timeStamp et status de chaque tampon : si le timestamp est figé,
+      le jeu considère « pas de nouvelle donnée » et ignore le toucher.
+11.2  Identifiant de doigt : incrémenter l'id à CHAQUE nouveau contact
+      (les jeux associent appui->relâchement par id ; id réutilisé =
+      tap ignoré).
+11.3  ESPACE DE COORDONNÉES : mesuré empiriquement avec un vrai doigt
+      via le diagnostic PHYS. Centre ≈ (960,540) → espace confirmé =
+      1920×1088 (2× la résolution d'écran 960×544). Une fausse piste
+      960×544 a été explorée puis abandonnée.
+11.4  *** RÈGLE D'OR *** Quand le PC n'appuie pas, NE RIEN ÉCRIRE dans
+      les tampons (passthrough intégral). Une injection « vide » 
+      permanente EFFACE le vrai doigt physique. Symptôme : « tactile
+      mort avec le plugin, vivant sans (boot avec L maintenu) ».
+11.5  Port audio inconnu (params non enregistrés) : NE RIEN FAIRE.
+      Lire un port avec des params par défaut trop larges cause un
+      overread mémoire → panic noyau → redémarrage silencieux.
+      Symptôme : « introuvable » juste après connexion car le premier
+      bip système déclenchait la lecture avec ch=2 défaut alors que le
+      buffer était mono.
+11.6  GESTES EN JEU (Killzone) : la réécriture complète de l'historique
+      avec la position courante détruit la trajectoire. Un système de
+      piste (trail) a rendu les gestes fonctionnels mais s'est révélé
+      fragile. Limitation connue : sous-menus profonds KZ inactifs.
+11.7  La position du curseur doit être gérée via RAW INPUT (WM_INPUT),
+      pas via les deltas de position (WM_MOUSEMOVE), car le recentrage
+      SetCursorPos génère des événements parasites inversés.
+
+PHASE 12 — FIABILISATION & CYCLE DE VIE
+--------------------------------------
+- Chien de garde : si aucun rapport PC pendant >1s pendant une session
+  active → tout relâcher (boutons, sticks, doigt fantôme).
+  ⚠️ NE JAMAIS appeler ksceKernelGetSystemTimeWide() depuis les rappels
+  USB ou touch hooks (contexte interdit = mort immédiate du canal).
+  Utiliser un simple compteur de séquence RX comparé depuis uvc_thread.
+- Chaînes de hooks respectueuses : appel de l'original via next->func si
+  un hook plus récent existe (macro TOUCH_CALL_OLD chain-aware). Plugins
+  co-installés : psvshell, osyscall6, yamt_helper, ioplus, nonpdrm,
+  repatch. Appeler cur->old directement court-circuite leurs hooks
+  (crash VitaShell sur Select expliqué).
+- Cycle de vie propre : hooks tactiles installés au démarrage, et
+  DÉSINSTALLÉS COMPLÈTEMENT (taiHookReleaseForKernel) après 1 s de
+  silence PC ; réinstallés dès que les rapports reprennent. La console
+  retrouve 100% de son tactile d'origine entre les sessions.
+
+PHASE 13 — VIDÉO (résolue) : DirectShow → Media Foundation
+----------------------------------------------------------
+DirectShow/AForge refusait le NV12 de la Vita (0 image/s).
+Remplacement par Media Foundation / MediaFrameReader :
+  - csproj : net8.0-windows10.0.22621.0 (projections WinRT complètes ;
+    la version 19041 était incomplète — manquait MediaFrameReader).
+  - Espaces de nommage : Windows.Media.Capture.Frames.* (PAS .Capture.*)
+    pour MediaFrameReader, MediaFrameSourceGroup, etc.
+  - Récupération de la source : mediaCapture.FrameSources[info.Id]
+    (PAS CreateFrameReaderAsync(info) qui prend un MediaFrameSource).
+  - Conversion SoftwareBitmap NV12 → Bgra8 → Bitmap GDI par lignes.
+  - BitmapPixelFormat.Bgra8 existe (pas Bgr8 !).
+Résultat : image fluide, compteur img/s au diagnostic.
+
+PHASE 14 — SON (tentative, puis reporté)
+----------------------------------------
+Hook sceAudioOutOutput (NID 0x02DB3F5F) + downmix mono 24 kHz +
+streaming sur rapport Input + silence local.
+PROBLÈMES RENCONTRÉS :
+  - Installation du crochet au boot tuait la détection USB entière
+    (module SceAudio peut ne pas être résident au chargement).
+  - ENABLE_AUDIO_STREAM=1 causait systématiquement l'échec de détection
+    (3 tentatives indépendantes), même avec allocation dynamique.
+  - Lecture du buffer son avec mauvais paramètres → panic noyau.
+DÉCISION : retour à la sauvegarde stable. Son reprogrammé plus tard.
+NOTES POUR LA REPRISE :
+  - NID sceAudioOutOutput : 0x02DB3F5F (lib SceAudio 0x438BB957)
+  - Pré-vérifier taiGetModuleInfoForKernel("SceAudio") avant hook
+  - Utiliser TAI_ANY_LIBRARY (exact-NID crashait aussi)
+  - len probablement en trames (frames) ; ch depuis OpenPort/SetConfig
+  - Downmix (L+R)/2 ; décimation freq/24000
+  - Capacité canal EP2 : 62 o/ms = 48 Ko/s (mono 24 kHz pile) — TROP
+    JUSTE. Préférer transport WiFi UDP (pas de limite de taille).
+  - Mute local : memset pBuffer avant appel original — fonctionne mais
+    vérifier interaction avec DMA driver.
+  - Le crochet lui-même s'installe SANS CRASH quand pré-vérifié avec
+    taiGetModuleInfoForKernel (mod=1 confirmé).
+
+PHASE 14b — SON VIA VIDÉO NV12 (tentative, puis désactivé)
+----------------------------------------------------------
+Approche : embarquer du PCM 24kHz mono s16 dans les 8 dernières lignes Y
+du flux vidéo NV12 via un encodage 2 bits/pixel (niveaux {25,95,165,235}).
+Le PC extrait les données depuis les lignes BGRA8 en bas de l'image,
+vérifie le CRC, et alimente waveOut 24kHz mono s16.
+
+RESULTAT : audio reconnaissable mais craquements inhérents non résolus.
+DÉSACTIVÉ en build 89 (tous les flags audio à 0). Code conservé in situ.
+
+### Format d'encodage
+- Payload : PCM mono 24kHz s16 LE, max 1728 octets/frame
+- En-tête AV : 'A','V',seq,len_lo,len_hi,crc (6 octets)
+- Balise TSEL : 'T','S','E','L' + len_lo, len_hi, crc (7 octets)
+- Encodage : 1 octet = 4 pixels BGRA. 2 bits par canal, niveaux {25,95,165,235}
+- Capacité max : 8 rows × 960 pixels ÷ 4 = 1920 octets/frame
+- Débit nécessaire : 48000 octets/s (24kHz × 2 bytes)
+- Débit réel mesuré : ~1024 octets/frame × 30fps ≈ 30720 octets/s
+
+### Flags de compilation (vita-udcd-uvc/src/main.c, lignes 162-170)
+  ENABLE_AUDIO_CAPTURE  = 1  (hooks audio + déclarations, gardé même désactivé)
+  ENABLE_AUDIO_PUSH     = 0  (hook sceAudioOutOutput : DÉSACTIVÉ)
+  ENABLE_AUDIO_HOOKTRY  = 0  (tentative installation hooks : DÉSACTIVÉ)
+  ENABLE_AUDIO_RECORDERS= 0  (hooks OpenPort/SetConfig : DÉSACTIVÉ)
+  ENABLE_AUDIO_INJECT   = 0  (encodage PCM dans rows Y : DÉSACTIVÉ)
+  ENABLE_AUDIO_STREAM   = 0  (audio via EP2 HID IN : déjà désactivé)
+  ENABLE_AUDIO_MUTE     = 0  (mute haut-parleur Vita)
+  ENABLE_AUDIO_PIDGRAB  = 0  (capture PID audio)
+  ENABLE_AUDIO_BISECT_PASSTHRU = 0
+
+  Pour réactiver : remettre à 1 CAPTURE, PUSH, HOOKTRY, RECORDERS, INJECT
+  (et optionnellement MUTE). Puis make clean && make côté Vita.
+
+### PC — réactivation audio (windows/MainForm.cs, ligne ~637)
+  if (buf[0] == 1 && buf[1] != 0xC7) {
+      continue;  // SUPPRIMER pour réactiver l'audio HID
+
+### Erreurs corrigées pendant le développement
+1.  Crash pBuffer (builds 65-66) : déréférencement direct de pBuffer
+    dans le hook → data abort. Fix : ksceKernelCopyFromUserProc avec
+    SceUID COMPLET (pas &0xFF).
+2.  Crash dcache (builds 65-66) : ksceKernelDcacheCleanInvalidateRange
+    trop gros. Fix : ksceKernelDcacheCleanRange sur 8 rows uniquement.
+3.  PID tronqué (build 78) : &0xFF n'est pas un handle valide.
+    Fix : SceUID complet de ksceKernelGetProcessId().
+4.  Bug k-loop (build 88) : boucle for(k=0;k<4) écrasait sym[0..3] à
+    chaque itération → 75% des données audio perdues. Fix : 1 byte par
+    groupe de 4 pixels.
+5.  uvc_frame_term crash : appelé au timeout du worker pendant DMA USB.
+    Fix : supprimé du chemin timeout.
+6.  Buffer circulaire 16/4 slots (builds 89v1, 90) : BSS trop gros →
+    Vita ne charge pas le plugin. Diagnostic non terminé.
+7.  Double-count HID+video (build 89 PC) : audio arrivait par 2 chemins
+    simultanément → queue gonfle → délài 2-3 secondes. Fix : désactiver
+    le chemin HID.
+8.  WaveOut gaps : Thread.Sleep entre writes → underrun → craquements.
+    Fix partiel : 4 buffers × 4800 bytes, seuil minimum 600 bytes.
+9.  List<byte> GC pauses : GetRange/RemoveRange O(n) + allocations →
+    micro-stutters. Fix : ring buffer natif byte[96000] head/tail.
+10. Doublons audio (build 91) : 2 slots lus sans tracker séquence →
+    données d'une frame précédente relues → clicks. Tentative de fix
+    avec aud_stage_read_seq : compile mais craquements restent.
+
+### Problème fondamental non résolu
+Le hook produit ~1024 octets par appel. Avec double-buffer (2 slots),
+on obtient ~1024-2048 octets/frame. À 30fps = 30720-61440 octets/s.
+Le minimum est 48000. Quand le jeu appelle sceAudioOutOutput une fois
+par frame → 30720 octets/s = 64% du nécessaire → 37% des samples
+manquants → craquements inhérents à l'approche.
+
+### Pistes pour résoudre (non implémentées)
+1. Plus de lignes : AUD_ROWS de 8 à 12+ (plus de capacité, bande plus
+   visible en bas de l'écran)
+2. Plus de slots : 4+ avec drain correct (nécessite diagnostiquer le
+   crash BSS du ring buffer)
+3. Canal séparé : EP2 HID en parallèle de la vidéo
+4. Échantillonnage 48kHz : double le débit mais nécessite plus de pixels
+5. Interpolation PC : remplacer samples manquants par interpolation
+   linéaire entre samples adjacents
+
+### Taille du plugin
+- Avec audio : ~16160 bytes
+- Sans audio (actuel, tous flags à 0) : 13907 bytes
+
+===============================================================================
+PHASE 15 — SESSION 27/08/2026 : RENOMMAGE VITASYNC, TUTO, CORRECTIONS
+===============================================================================
+
+15.1  RENOMMAGE COMPLET → VITASYNC
+      - Application Windows : `VitaSync.exe` (renommée via csproj).
+        Les anciens `VitaPCControl.exe` ont été supprimés des bin.
+      - Plugin Vita : `VitaSync.skprx` (13 907 octets). Nom UVC du
+        device : `VITASYNC` (UVC_DRIVER_NAME dans vita-udcd-uvc/src/main.c,
+        max 15 caractères respecté). PID USB : 0x1337 — identique côté
+        Windows (`d.ProductID == 0x1337`).
+      - `ur0:tai/config.txt` : `ur0:tai/VitaSync.skprx` (ligne *KERNEL).
+      - Dossier de réglages : `%APPDATA%\VitaSync\`.
+      - Sources nettoyées : plus de traces des anciens noms dans le
+        projet. `C:\VitaDev\` est une copie PÉRIMÉE (anciens noms) — ne
+        pas utiliser. Le `udcd` restant dans main.c = API système Vita
+        (SceUdcd/ksceUdcd*) → normal.
+
+15.2  TUTORIEL D'INSTALLATION (mini tuto, nouveau)
+      - Affiché plein écran après le choix de langue, UNE seule fois
+        (flag `%APPDATA%\VitaSync\tutoDone.txt`, sauté si présent).
+      - 5 pages, traduites FR/EN/ES :
+          1 = présentation + bouton « Télécharger le plugin »
+          2 = ur0:/tai/ (VitaShell)
+          3 = config.txt (*KERNEL + ur0:tai/VitaSync.skprx)
+          4 = redémarrage de la Vita
+          5 = connecter / jouer (schéma conservé)
+      - Navigation : boutons + clavier (◀ ▶ / Entrée / Échap = fin).
+        Bouton « Terminer » / Skip : marque le tuto comme vu.
+      - Bouton Télécharger (page 1) : copie le `VitaSync.skprx` embarqué
+        (à côté de l'exe) vers `Téléchargements` et ouvre l'Explorateur.
+      - Images : jusqu'à 3 par page, affichées côte à côte dans l'ordre
+        avec badge 1/2/3. Sources : `%APPDATA%\VitaSync\tuto\` (prioritaire)
+        sinon `assets\tuto\` (à côté de l'exe). Noms : `{page}.png` ou
+        `{page}-1.png`, `{page}-2.png`… (ex. page 2 = 2-1/2-2/2-3).
+      - Captures réelles intégrées : page 1 (1.png), page 2 (2-1/2-2/2-3),
+        page 3 (3-1/3-2), page 4 (4-1/4-2). Page 5 = schéma d'origine.
+
+15.3  CORRECTION VIDÉO — RÉACTIVITÉ (décalage)
+      - Cause : en .NET 8, `PictureBox.Image = ...` DÉTRUIT l'image
+        remplacée → le double-tampon vidéo (videoBmp0/1) devenait invalide
+        une image sur deux → frames perdues.
+      - Fix : nouveau contrôle `VideoSurface` (MainForm.cs) qui POSSÈDE
+        ses bitmaps (`Publish` + `Invalidate`), garde le getter `Image`,
+        dessine en Zoom NearestNeighbor/CompositingMode.SourceCopy.
+      - Blit : 1 seul `Marshal.Copy` si Stride identique (sinon par ligne).
+      - Allocations `g16`/`rowG` sorties de la boucle par frame.
+      - Garde : ne pas disposer le bitmap actuellement affiché quand la
+        résolution change.
+
+15.4  CORRECTION FLÈCHES / D-PAD
+      - Symptôme : Bas/Gauche/Haut/Droite « ne sont plus mappées ».
+      - Cause : les touches fléchées sont des touches de navigation
+        WinForms — avalées par `ProcessCmdKey` (navigation du focus)
+        AVANT d'atteindre `OnKeyDown`. La croix directionnelle ne
+        recevait rien.
+      - Fix : capture des flèches directement dans `ProcessCmdKey`
+        (MainForm.cs) quand elles correspondent à un bouton Vita ;
+        relâchement toujours géré par `OnKeyUp`.
+
+15.5  OVERLAY F11 (infos) — RETOUR À L'ORIGINAL
+      - Tenté « fond en direct » (image vidéo live derrière le HUD) :
+        gel total de la vidéo. REVENU EN ARRIÈRE : comportement d'origine
+        (fond = image figée au moment de l'appui + voile noir translucide).
+        Aucun gel. Définitif.
+
+15.6  AUDIO — MENTIONS RETIRÉES DES TEXTES
+      - Phrases audio supprimées du tutoriel (page 5) et de la FAQ, dans
+        les 3 langues (FR/EN/ES). Code de lecture inchangé, toujours
+        désactivé.
+
+===============================================================================
+ÉTAT FINAL DES SOURCES (build v13)
+===============================================================================
+PLUGIN (main.c) contient :
+- Hooks SceUdcd (offset, chaîne-aware) ✓
+- Touch hooks ×6 (SceTouch, globaux, install/remove lifecycle) ✓
+- Ctrl emulation (analog slot 0, buttons slots 1-3) ✓
+- Neutral calibration sticks ✓
+- Trigger alias bits (L→L1, R→R1) ✓
+- Heartbeat diagnostics (64 octets, ID1) ✓
+- WiFi socket/sendto code (présent mais INACTIF — pour usage futur)
+- Audio ring buffer statique 8 Ko (présent mais INACTIF)
+- Exit game via ksceAppMgrKillProcess (présent mais NON DÉCLENCHÉ)
+
+APP (MainForm.cs) contient :
+- Capture vidéo Media Foundation ✓
+- Contrôles clavier/souris ✓
+- Mode FPS F8 (raw input, capture, recentrage) ✓
+- Touch injection via output report byte[7..10] ✓
+- Sensibilité persistante (%APPDATA%\VitaSync\sensitivity.txt) ✓
+- UDP listener port 27319 (pour futur flux audio WiFi) ✓
+- Audio player waveOut 24kHz mono (dormant, prêt pour usage futur) ✓
+- VideoSurface : affichage vidéo basse latence (bitmaps propriétaires,
+  blit unique, zoom NearestNeighbor) ✓ [PHASE 15.3]
+- Flèches D-pad capturées via ProcessCmdKey (navigation WinForms) ✓ [PHASE 15.4]
+- Tutoriel d'installation 5 pages FR/EN/ES (flag tutoDone.txt, images
+  personnalisables) ✓ [PHASE 15.2]
+
+===============================================================================
+MAPPING FINAL DES TOUCHES
+===============================================================================
+ZQSD          → Joystick gauche (déplacement)
+Souris (F8)   → Joystick droit (caméra)
+E             → △ Triangle
+R             → □ Carré
+Maj (Shift)   → ○ Rond
+Espace        → × Croix
+F1            → Gâchette L
+F2            → Gâchette R
+F3            → SELECT
+F4            → START
+Flèches       → Croix directionnelle
+F8            → Mode capture souris FPS
+Clic image    → Pression tactile (hors mode FPS)
+
+===============================================================================
+À FAIRE (PROCHAINE SESSION)
+===============================================================================
+1. 🔊 SON SUR PC — Suite
+   L'audio via vidéo NV12 fonctionne (CRC passe, audio reconnaissable) mais
+   craquements liés au débit insuffisant (30720 vs 48000 octets/s nécessaires).
+   DÉSACTIVÉ en build 89. Voir PHASE 14b pour détails, flags, erreurs, pistes.
+   Approche alternative : UDP par WiFi (non testée, notes dans PHASE 14).
+
+2. 🏠 BOUTON PS (retour LiveArea)
+   Impossible via émulation SceCtrl (bouton matériel système).
+   Alternative possible : ksceAppMgrKillProcess(pid_du_jeu) pour
+   quitter le jeu. Nécessite de capturer le PID via ksceKernelGetProcessId()
+   dans les touch hooks (le code était implémenté mais causait des
+   problèmes de détection — à investiguer).
+
+3. 🎮 Confort : plein écran vidéo, masquer interface, profils par jeu.
+
+===============================================================================
+PROCÉDURE DE RESTAURATION (si besoin)
+===============================================================================
+1. Copier le skprx du backup (VitaSync.skprx, ou udcd_uvc.skprx si le
+   backup n'est pas encore renommé) → ur0:tai/ (config.txt : ur0:tai/VitaSync.skprx)
+2. Redémarrer complètement la Vita
+3. Lancer l'exe du backup (VitaSync.exe, ou VitaPCControl.exe si non renommé)
+4. Tout revient : vidéo, contrôles, tactile, F8, gâchettes
+
+⚠️ En cas de blocage au démarrage de la Vita : redémarrer avec la
+   touche L MAINTENUE dès l'appui sur power (saute les plugins).

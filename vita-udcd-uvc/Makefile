@@ -4,7 +4,7 @@ LIBS	= -lSceSysmemForDriver_stub -lSceThreadmgrForDriver_stub \
 	-lSceCpuForDriver_stub -lSceUdcdForDriver_stub \
 	-lSceDisplayForDriver_stub -lSceIftuForDriver_stub \
 	-lSceCtrlForDriver_stub -ltaihenForKernel_stub -lSceTouchForDriver_stub \
-	-lSceAppMgrForDriver_stub
+	-lSceAppMgrForDriver_stub -lSceKernelSuspendForDriver_stub
 ifeq ($(DEBUG), 1)
 	OBJS	+= debug/log.o
 	CFLAGS	+= -DDEBUG -Idebug

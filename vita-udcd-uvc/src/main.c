@@ -6,6 +6,7 @@
 #include <psp2kern/display.h>
 #include <psp2kern/appmgr.h>
 #include <psp2kern/ctrl.h>
+#include <psp2kern/kernel/suspend.h>
 #include <psp2kern/lowio/iftu.h>
 #include <psp2kern/kernel/sysmem/data_transfers.h>
 #include <taihen.h>
@@ -2139,6 +2140,7 @@ static int uvc_thread(SceSize args, void *argp)
 	SceUInt64 last_rx_change = last_hb;
 	SceUInt64 next_audio_try = 0;
 	unsigned int audio_tries = 0;
+	SceUInt64 next_power_tick = 0;
 
 	while (uvc_thread_run) {
 		unsigned int out_bits;
@@ -2153,6 +2155,19 @@ static int uvc_thread(SceSize args, void *argp)
 		pc_control_apply();
 
 		SceUInt64 now = ksceKernelGetSystemTimeWide();
+
+		/* Garde-eveil : pendant le streaming, annule TOUS les
+		 * minuteurs d'economie d'energie du systeme (veille auto,
+		 * extinction OLED, assombrissement OLED). Sinon la Vita se
+		 * met en standby toute seule au bout d'un moment (et l'ecran
+		 * s'assombrit d'abord). Aucun impact en jeu : seule la
+		 * bascule power-save est concernee, aucune entree injectee. */
+		if (stream && now >= next_power_tick) {
+			ksceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+			ksceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF);
+			ksceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_OLED_DIMMING);
+			next_power_tick = now + 10 * 1000 * 1000;
+		}
 
 		/* (Re)install touch interceptors once PC reports flow. */
 		if (touch_hooks_wanted && !touch_hooks_installed) {

@@ -24,7 +24,7 @@ controller directly performs a DMA transfer from the physical address of the res
 
 **Download**:
 
-* [VitaSync.skprx](https://github.com/xerpi/vita-udcd-uvc/releases)
+* [VitaSync.skprx](https://github.com/jeff20001-new/VitaSync/releases)
 
 **Compilation**
 

@@ -7,18 +7,18 @@ obj/
 TestResults/
 *.log
 
-# Vita plugin build artifacts (vita-udcd-uvc)
-vita-udcd-uvc/**/*.o
-vita-udcd-uvc/**/*.d
-vita-udcd-uvc/**/*.elf
-vita-udcd-uvc/**/*.velf
-vita-udcd-uvc/**/*.self
-vita-udcd-uvc/**/*.suprx
-vita-udcd-uvc/**/*.skprx
-vita-udcd-uvc/**/*.bin
-vita-udcd-uvc/**/*.map
-vita-udcd-uvc/build/
-vita-udcd-uvc/taiHEN/
+# Vita plugin build artifacts (VitaSync)
+VitaSync/**/*.o
+VitaSync/**/*.d
+VitaSync/**/*.elf
+VitaSync/**/*.velf
+VitaSync/**/*.self
+VitaSync/**/*.suprx
+VitaSync/**/*.skprx
+VitaSync/**/*.bin
+VitaSync/**/*.map
+VitaSync/build/
+VitaSync/taiHEN/
 
 # OS clutter
 .DS_Store

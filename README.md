@@ -7,7 +7,7 @@ Prototype basé sur le fork modifié de **`vita-udcd-uvc` 1.7** (`xerpi/vita-udc
 
 ## Deux composants
 
-- `vita-udcd-uvc/` — plugin kernel Vita (`VitaSync.skprx`) : UVC + interface
+- `VitaSync/` — plugin kernel Vita (`VitaSync.skprx`) : UVC + interface
   HID vendor USB. Nom UVC du device : `VITASYNC`, PID USB `0x1337`.
 - `windows/` — application C#/.NET 8 WinForms (`VitaSync.exe`) : vidéo Media
   Foundation, HID (HidSharp), mapping clavier/souris, tactile, mode FPS F8,
@@ -43,8 +43,6 @@ Réglages utilisateur : `%APPDATA%\VitaSync\` (`sensitivity.txt`, `lang.txt`,
 
 ## Divers
 
-- `MISE_A_JOUR_RAPPORT_2026-08-24.txt` — rapport technique complet du projet
-  (architecture, mapping, historique des phases, procédure de restauration).
 - Dossier `build` / `bin` volontairement ignorés par Git (artefacts de compilation).
 
 ## ⚠️ Avertissement

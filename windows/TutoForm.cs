@@ -20,8 +20,10 @@ internal sealed class TutoForm : Form
 
     static string Img(string name)
     {
+#if !APPTEST
         string custom = Path.Combine(CustomDir, name);
         if (File.Exists(custom)) return custom;
+#endif
         return Path.Combine(BundledDir, name);
     }
 
@@ -40,15 +42,25 @@ internal sealed class TutoForm : Form
 
     public static bool Done
     {
-        get { try { return File.Exists(FlagPath); } catch { return false; } }
+        get {
+#if APPTEST
+            return false;
+#else
+            try { return File.Exists(FlagPath); } catch { return false; }
+#endif
+        }
     }
 
     public static void MarkDone()
     {
+#if APPTEST
+        return;
+#else
         try {
             Directory.CreateDirectory(Path.GetDirectoryName(FlagPath)!);
             File.WriteAllText(FlagPath, "1");
         } catch { }
+#endif
     }
 
     int slide;
@@ -68,6 +80,9 @@ internal sealed class TutoForm : Form
 
     public TutoForm()
     {
+#if APPTEST
+        try { System.IO.File.AppendAllText(System.IO.Path.Combine(AppContext.BaseDirectory, "debug_tuto.log"), "TUTO_OK" + Environment.NewLine); } catch { }
+#endif
         Text = "VitaSync";
         WindowState = FormWindowState.Maximized;
         FormBorderStyle = FormBorderStyle.None;
@@ -211,19 +226,22 @@ internal sealed class TutoForm : Form
 
         int zoneX = (int)(W * 0.07f), zoneY = (int)(H * 0.14f);
         int zoneW = (int)(W * 0.40f), zoneH = (int)(H * 0.56f);
-        int zoneR = (int)(W * 0.07f) + zoneW;
+        if (slide > 2) {
+            zoneX = (int)(W * 0.05f); zoneY = (int)(H * 0.09f);
+            zoneW = (int)(W * 0.44f); zoneH = (int)(H * 0.64f);
+        }
         int visible = 0;
         for (int n = 0; n < MaxImgs; n++)
             if (pics[n].Visible) visible++;
-        int gap = (int)(W * 0.012f);
         if (visible > 1) {
-            int w = (zoneW - gap * (visible - 1)) / visible;
-            int x = zoneX;
-            for (int n = 0; n < MaxImgs && x < zoneR; n++) {
+            int gh = (int)(H * 0.012f);
+            int h = (zoneH - gh * (visible - 1)) / visible;
+            int y = zoneY;
+            for (int n = 0; n < MaxImgs && y + h <= zoneY + zoneH; n++) {
                 if (!pics[n].Visible) continue;
-                pics[n].Left = x; pics[n].Top = zoneY; pics[n].Width = w; pics[n].Height = zoneH;
-                ptags[n].Left = x + 8; ptags[n].Top = zoneY + 8;
-                x += w + gap;
+                pics[n].Left = zoneX; pics[n].Top = y; pics[n].Width = zoneW; pics[n].Height = h;
+                ptags[n].Left = zoneX + 8; ptags[n].Top = y + 8;
+                y += h + gh;
             }
         } else {
             pics[0].Left = zoneX; pics[0].Top = zoneY; pics[0].Width = zoneW; pics[0].Height = zoneH;

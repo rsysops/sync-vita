@@ -643,6 +643,8 @@ internal static class L
     public static bool Load()
     {
 #if APPTEST
+        _lang = "fr";
+        _s = All[_lang];
         return false;
 #else
         try {

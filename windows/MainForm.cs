@@ -66,11 +66,16 @@ public class MainForm : Form
     System.Threading.Thread? sendThread;
     volatile bool sendRunning;
     int sensCache = 700;
+    readonly byte[] rawBuf = new byte[64];
+    GCHandle rawHandle;
+    Thread? rawThread;
+    volatile bool rawThreadRun;
+    IntPtr rawWnd;
+    WndProcDelegate? rawWndProc;
     Point cursorCenter = Point.Empty;
     readonly object sync = new();
     ushort buttons;
     byte lx=128, ly=128, rx=128, ry=128;
-    int rxS=128, ryS=128;
     int mouseDx, mouseDy;
     bool touchDown;
     int touchX, touchY;
@@ -877,7 +882,15 @@ public class MainForm : Form
         ovFlow.Controls.Add(debugLabel);
 
         /* ── Send loop: dedicated thread (WinForms timer dies under video message flood) ── */
-        FormClosing += (_,__) => { timeEndPeriod(1); mouse?.Dispose(); StopControl(); };
+        FormClosing += (_,__) => {
+            timeEndPeriod(1); mouse?.Dispose(); StopControl();
+            rawThreadRun = false;
+            var rt = rawThread;
+            if (rt != null) {
+                try { PostThreadMessage((uint)rt.ManagedThreadId, 0x0012, IntPtr.Zero, IntPtr.Zero); } catch { }
+                try { rt.Join(250); } catch { }
+            }
+        };
 
         mouse = new MouseHook(this);
         mouse.MouseButton += MouseButton;
@@ -1104,6 +1117,8 @@ public class MainForm : Form
        INPUT
        ═══════════════════════════════════════════ */
     int tickCount = 0;
+    volatile int dbgRx, dbgRy, dbgDx, dbgDy, dbgRawEv;
+    double lookVx, lookVy;
     void PollKeys()
     {
         tickCount++;
@@ -1241,6 +1256,7 @@ public class MainForm : Form
             var b = Bounds;
             var r = new RECT { Left=b.Left, Top=b.Top, Right=b.Right, Bottom=b.Bottom };
             ClipCursor(ref r);
+            UpdateCursorCenter();
         } else {
             ClipCursor(IntPtr.Zero);
             Cursor.Show();
@@ -1499,16 +1515,43 @@ public class MainForm : Form
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
-        var rid = new RAWINPUTDEVICE { usUsagePage = 1, usUsage = 2, dwFlags = 0, hwndTarget = Handle };
-        RegisterRawInputDevices(new[] { rid }, 1, (uint)Marshal.SizeOf<RAWINPUTDEVICE>());
+        rawHandle = GCHandle.Alloc(rawBuf, GCHandleType.Pinned);
+        rawThreadRun = true;
+        rawThread = new Thread(RawInputThreadMain) { IsBackground = true, Name = "RawInput" };
+        rawThread.Start();
     }
 
     const int WM_INPUT = 0x00FF;
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == WM_INPUT) ReadRawMouse(m.LParam);
         base.WndProc(ref m);
     }
+
+    void RawInputThreadMain()
+    {
+        var cls = "VitaSyncRawWnd2";
+        rawWndProc = RawWndProc;
+        var wc = new WNDCLASS {
+            lpfnWndProc = Marshal.GetFunctionPointerForDelegate(rawWndProc),
+            lpszClassName = cls,
+            hInstance = GetModuleHandle(null)
+        };
+        RegisterClass(ref wc);
+        var hwnd = CreateWindowEx(0, cls, "raw", 0, 0, 0, 0, 0, (IntPtr)(-3),
+                                  IntPtr.Zero, GetModuleHandle(null), IntPtr.Zero);
+        rawWnd = hwnd;
+        if (hwnd != IntPtr.Zero) {
+            var rid = new RAWINPUTDEVICE { usUsagePage = 1, usUsage = 2, dwFlags = 0x100, hwndTarget = hwnd };
+            RegisterRawInputDevices(new[] { rid }, 1, (uint)Marshal.SizeOf<RAWINPUTDEVICE>());
+        }
+        while (rawThreadRun && rawWnd != IntPtr.Zero) {
+            if (!GetMessage(out var msg, rawWnd, 0, 0)) break;
+            if (msg.message == WM_INPUT) ReadRawMouse(msg.lParam);
+        }
+        if (rawWnd != IntPtr.Zero) { DestroyWindow(rawWnd); rawWnd = IntPtr.Zero; }
+    }
+
+    IntPtr RawWndProc(IntPtr h, uint m, IntPtr w, IntPtr l) => DefWindowProc(h, m, w, l);
 
     void ReadRawMouse(IntPtr hRawInput)
     {
@@ -1516,23 +1559,41 @@ public class MainForm : Form
         uint hdr = (uint)(4 + 4 + 2 * IntPtr.Size);
         uint size = 0;
         if (GetRawInputData(hRawInput, RID_INPUT, IntPtr.Zero, ref size, hdr) == unchecked((uint)-1) || size == 0) return;
-        var p = Marshal.AllocHGlobal((int)size);
-        try {
-            if (GetRawInputData(hRawInput, RID_INPUT, p, ref size, hdr) == unchecked((uint)-1)) return;
-            int off = (int)hdr;
-            short flags = Marshal.ReadInt16(p, off);
-            if (flags != 0) return;
-            int dx = Marshal.ReadInt32(p, off + 12);
-            int dy = Marshal.ReadInt32(p, off + 16);
-            if (dx != 0 || dy != 0) {
-                lock (sync) { mouseDx += dx; mouseDy += dy; }
-            }
-        } finally { Marshal.FreeHGlobal(p); }
+        if (size > rawBuf.Length) return;
+        var data = rawHandle.AddrOfPinnedObject();
+        if (GetRawInputData(hRawInput, RID_INPUT, data, ref size, hdr) == unchecked((uint)-1)) return;
+        int off = (int)hdr;
+        if (Marshal.ReadInt16(data, off) != 0) return;
+        int dx = Marshal.ReadInt32(data, off + 10);
+        int dy = Marshal.ReadInt32(data, off + 14);
+        if (dx != 0 || dy != 0) {
+            lock (sync) { mouseDx += dx; mouseDy += dy; }
+            dbgRawEv++;
+        }
     }
 
     [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr hRawInput, uint cmd, IntPtr data, ref uint size, uint cbSizeHeader);
     [DllImport("user32.dll")] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint count, uint cbSize);
     [StructLayout(LayoutKind.Sequential)] struct RAWINPUTDEVICE { public ushort usUsagePage, usUsage; public uint dwFlags; public IntPtr hwndTarget; }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern ushort RegisterClass(ref WNDCLASS wc);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateWindowEx(uint exStyle, string cls, string name, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMessage(out NativeMessage msg, IntPtr hWnd, uint min, uint max);
+    [DllImport("user32.dll")] static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool PostThreadMessage(uint idThread, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string? name);
+    delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct WNDCLASS {
+        public uint style;
+        public IntPtr lpfnWndProc;
+        public int cbClsExtra, cbWndExtra;
+        public IntPtr hInstance, hIcon, hCursor, hbrBackground;
+        [MarshalAs(UnmanagedType.LPWStr)] public string? lpszMenuName, lpszClassName;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct NativeMessage { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int ptX, ptY; }
 
     void StopVideoSync()
     {
@@ -1810,13 +1871,22 @@ lastCrcInfo = $"payLen={len} crc={(crcOk ? 1 : 0)}";
         bool exitCmd;
         lock(sync) {
             int sens=sensCache;
-            int dx=Math.Clamp(mouseDx,-100,100); int dy=Math.Clamp(mouseDy,-100,100);
+            double dvx = 0, dvy = 0;
+            if (capturing) {
+                dvx = lookVx * 0.5 + mouseDx;
+                dvy = lookVy * 0.5 + mouseDy;
+                if (Math.Abs(dvx) < 0.5) dvx = 0;
+                if (Math.Abs(dvy) < 0.5) dvy = 0;
+            }
+            lookVx = dvx; lookVy = dvy;
             mouseDx=mouseDy=0;
-            int tRx=Math.Clamp(128 + dx*sens/5,0,255);
-            int tRy=Math.Clamp(128 + dy*sens/5,0,255);
-            rxS += ((tRx-rxS)*70)/100; if (Math.Abs(tRx-rxS)<2) rxS=tRx;
-            ryS += ((tRy-ryS)*70)/100; if (Math.Abs(tRy-ryS)<2) ryS=tRy;
-            rx=(byte)rxS; ry=(byte)ryS;
+            int ax = (int)Math.Clamp(dvx, -127, 127);
+            int ay = (int)Math.Clamp(dvy, -127, 127);
+            dbgDx=ax; dbgDy=ay;
+            int tRx=Math.Clamp(128 + ax*sens/2,0,255);
+            int tRy=Math.Clamp(128 + ay*sens/2,0,255);
+            rx=(byte)tRx; ry=(byte)tRy;
+            dbgRx=rx; dbgRy=ry;
             r[0]=2;
             r[1]=(byte)(buttons&255); r[2]=(byte)(buttons>>8);
             r[3]=lx; r[4]=ly; r[5]=rx; r[6]=ry;
@@ -1891,7 +1961,8 @@ lastCrcInfo = $"payLen={len} crc={(crcOk ? 1 : 0)}";
                                $"audio: hook={buf[60]&1} cap={(buf[60]>>1)&1} mod={(buf[60]>>2)&1}\n" +
                                $"exit: recu={buf[6]} ph={(buf[61]>>6)&3} res={(buf[61]>>4)&3} pid={buf[58]|((buf[59]&0x0F)<<8)} bloc={buf[5]}\n" +
                                $"audio: etat={buf[59]>>4} pkt={buf[62]>>4} ring={(buf[62]&0xF)*512}o\n" +
-                               $"build={buf[63]}";
+                               $"build={buf[63]}\n" +
+                               $"CV: ev brut={dbgRawEv} dx={dbgDx} dy={dbgDy}  envoye RX/RY={dbgRx}/{dbgRy}  sens={sensCache} capture={capturing}";
                     BeginInvoke(() => {
                         diag.Text = t;
                         int pkt = buf[62] & 0xF;

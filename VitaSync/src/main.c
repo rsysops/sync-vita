@@ -1063,7 +1063,7 @@ static void pc_control_apply(void)
                                        (unsigned char)PC_CLAMP8((int)pc_neutral_ly + (int)pc_ly - 128),
                                        (unsigned char)PC_CLAMP8((int)pc_neutral_rx + (int)pc_rx - 128),
                                        (unsigned char)PC_CLAMP8((int)pc_neutral_ry + (int)pc_ry - 128),
-                                       4);
+                                       2);
 
     /* Try everything at once: every available slot (they combine), both
      * the user-space and kernel-space masks, and a long uiMake. The

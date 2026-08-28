@@ -3,7 +3,7 @@
 Streamer la vidéo de la PS Vita sur PC **et** piloter la console (stick, boutons,
 tactile, gâchettes) par USB, le tout dans une seule application Windows.
 
-Prototype basé sur le fork modifié de **`VitaSync` 1.7** (licence MIT).
+Prototype basé sur le fork modifié de **`vita-udcd-uvc` 1.7** (`xerpi/vita-udcd-uvc`, licence MIT).
 
 ## Deux composants
 

@@ -1,59 +1,59 @@
-# VitaSync — Streaming & contrôle PS Vita via USB
+# VitaSync — PS Vita streaming & control over USB
 
-Streamer la vidéo de la PS Vita sur PC **et** piloter la console (stick, boutons,
-tactile, gâchettes) par USB, le tout dans une seule application Windows.
+Stream the PS Vita screen to your PC **and** control the console (sticks, buttons,
+touch, triggers) over USB, all within a single Windows application.
 
-Prototype basé sur le fork modifié de **`vita-udcd-uvc` 1.7** (`xerpi/vita-udcd-uvc`, licence MIT).
+Prototype based on a modified fork of **`vita-udcd-uvc` 1.7** (`xerpi/vita-udcd-uvc`, MIT license).
 
-## Deux composants
+## Two components
 
-- `VitaSync/` — plugin kernel Vita (`VitaSync.skprx`) : UVC + interface
-  HID vendor USB. Nom UVC du device : `VITASYNC`, PID USB `0x1337`.
-- `windows/` — application C#/.NET 8 WinForms (`VitaSync.exe`) : vidéo Media
-  Foundation, HID (HidSharp), mapping clavier/souris, tactile, mode FPS F8,
-  tutoriel d'installation intégré (5 pages, FR/EN/ES).
+- `VitaSync/` — Vita kernel plugin (`VitaSync.skprx`) : UVC + vendor HID USB
+  interface. UVC device name: `VITASYNC`, USB PID `0x1337`.
+- `windows/` — C#/.NET 8 WinForms application (`VitaSync.exe`): Media Foundation
+  video, HID (HidSharp), keyboard/mouse mapping, touch, F8 FPS mode, built-in
+  installation tutorial (5 pages, EN/FR/ES).
 
-## Installer le plugin sur la Vita
+## Installing the plugin on the Vita
 
-1. Copier `VitaSync.skprx` dans `ur0:tai/` (VitaShell).
-2. Ajouter au `ur0:tai/config.txt` :
+1. Copy `VitaSync.skprx` into `ur0:tai/` (VitaShell).
+2. Add to `ur0:tai/config.txt`:
 
    ```
    *KERNEL
    ur0:tai/VitaSync.skprx
    ```
 
-3. Redémarrer complètement la Vita.
+3. Reboot the Vita completely.
 
-> Le bouton de téléchargement du tutoriel récupère automatiquement le plugin
-> embarqué et le copie dans `Téléchargements`.
+> The tutorial's download button fetches the embedded plugin automatically and
+> copies it into your Downloads folder.
 
-## Dépannage vidéo
+## Video troubleshooting
 
-Il arrive parfois que la vidéo ne démarre pas du premier coup. Dans ce cas,
-relancer la capture vidéo plusieurs fois (arrêter puis redémarrer) jusqu'à ce
-que l'image s'affiche. Ne pas hésiter à insister : c'est un comportement
-connu du prototype, l'image finit toujours par arriver.
+Sometimes the video does not start on the first try. In that case, restart the
+video capture a few times (stop, then start again) until the image shows up.
+Don't hesitate to insist: it is a known behavior of the prototype, the image
+always eventually arrives.
 
-## Compiler l'application Windows
+## Building the Windows application
 
 ```powershell
 cd windows
 dotnet build -c Release
 ```
 
-Exécutable : `windows\bin\Release\net8.0-windows10.0.22621.0\VitaSync.exe`
-(fichier `VitaPCControl.csproj` = nom de projet historique, l'exe est `VitaSync.exe`).
+Executable: `windows\bin\Release\net8.0-windows10.0.22621.0\VitaSync.exe`
+(`VitaPCControl.csproj` is the historical project name; the executable is `VitaSync.exe`).
 
-Réglages utilisateur : `%APPDATA%\VitaSync\` (`sensitivity.txt`, `lang.txt`,
-`keymap.txt`, `tutoDone.txt`). Le tutoriel n'apparaît qu'une fois (via `tutoDone.txt`).
+User settings: `%APPDATA%\VitaSync\` (`sensitivity.txt`, `lang.txt`,
+`keymap.txt`, `tutoDone.txt`). The tutorial only appears once (via `tutoDone.txt`).
 
-## Divers
+## Misc
 
-- Dossier `build` / `bin` volontairement ignorés par Git (artefacts de compilation).
+- `build` / `bin` folders intentionally ignored by Git (build artifacts).
 
-## ⚠️ Avertissement
+## ⚠️ Warning
 
-Prototype non testé comme release officielle. À tester sur une vraie Vita avant
-utilisation. Le plugin est chargé en kernel — risque de blocage (secours :
-redémarrer la Vita en maintenant **L** pour sauter les plugins).
+Prototype not tested as an official release. Test it on a real Vita before use.
+The plugin loads in kernel — risk of hang (fallback: reboot the Vita while
+holding **L** to skip plugins).

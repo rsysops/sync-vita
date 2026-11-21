@@ -15,6 +15,22 @@
 #include "usb_descriptors.h"
 #include "uvc.h"
 
+/* Debug log (make DEBUG=1): lines are buffered and written to
+ * ux0:dump/VitaSync_log.txt by DFLUSH(), or by DFLUSH_SAFE() once VitaShell's
+ * USB transfer may be open (see dbg_flush_if_safe). Only call these from
+ * module_start and uvc_thread, never from USB or hook callbacks. DCALL(expr) evaluates
+ * expr, logs its return code and yields it; without DEBUG it is just expr. */
+#ifdef DEBUG
+#include "log.h"
+#define DLOG(...)	LOG_TO_FILE(__VA_ARGS__)
+#define DFLUSH()	log_flush()
+#else
+#define DLOG(...)	((void)0)
+#define DFLUSH()	((void)0)
+#endif
+#define DCALL(expr)	({ int r__ = (int)(expr); \
+			   DLOG(#expr " = 0x%08X\n", r__); r__; })
+
 #define ALIGN(x, a)			(((x) + ((a) - 1)) & ~((a) - 1))
 #define UNUSED(x)			((void)x)
 
@@ -1806,8 +1822,18 @@ static int uvc_udcd_change_setting(int interfaceNumber, int alternateSetting, in
 	return 0;
 }
 
+#ifdef DEBUG
+/* Counted here, logged by uvc_thread (no file IO in USB callbacks). */
+static volatile unsigned int dbg_attach_n, dbg_detach_n;
+static volatile int dbg_attach_usb_version;
+#endif
+
 static int uvc_udcd_attach(int usb_version, void *user_data)
 {
+#ifdef DEBUG
+	dbg_attach_usb_version = usb_version;
+	dbg_attach_n++;
+#endif
 	/* Measure the sticks' rest position BEFORE enabling anything, while
 	 * the values read are still the untouched hardware ones. */
 	pc_ctrl_capture_neutral();
@@ -1831,6 +1857,9 @@ static int uvc_udcd_attach(int usb_version, void *user_data)
 
 static void uvc_udcd_detach(void *user_data)
 {
+#ifdef DEBUG
+	dbg_detach_n++;
+#endif
 	uvc_handle_video_abort();
 	ksceUdcdReqCancelAll(&endpoints[3]);
 	pc_control_release();
@@ -1848,13 +1877,29 @@ static void uvc_udcd_configure(int usb_version, int desc_count, SceUdcdInterface
 {
 }
 
+/* udcd calls these when our driver is started or stopped, including when
+ * VitaShell's USB transfer stops every driver as it opens. One of the two
+ * signals the retake check in uvc_thread relies on. */
+static volatile int usb_driver_running;
+#ifdef DEBUG
+static volatile unsigned int dbg_drv_start_n, dbg_drv_stop_n;
+#endif
+
 static int uvc_driver_start(int size, void *p, void *user_data)
 {
+	usb_driver_running = 1;
+#ifdef DEBUG
+	dbg_drv_start_n++;
+#endif
 	return 0;
 }
 
 static int uvc_driver_stop(int size, void *p, void *user_data)
 {
+	usb_driver_running = 0;
+#ifdef DEBUG
+	dbg_drv_stop_n++;
+#endif
 	return 0;
 }
 
@@ -1904,6 +1949,8 @@ static unsigned int uvc_frame_transfer(struct uvc_frame *frame,
 
 int uvc_start(void);
 int uvc_stop(void);
+static int usb_takeover(void);
+static void usb_restore_mtp(void);
 
 static inline unsigned int display_to_iftu_pixelformat(unsigned int fmt)
 {
@@ -2123,12 +2170,123 @@ static int display_vblank_cb_func(int notifyId, int notifyCount, int notifyArg, 
 	return 0;
 }
 
+/* Raw ksceUdcdGetDrvState values read right after the boot takeover, when
+ * our driver is known to be running and MTP known to be stopped. Later
+ * states are compared with these instead of being decoded: the meaning of
+ * the bits did not match vitasdk's documentation on hardware (build of
+ * 2026-11-21 read our running driver as stopped and retook USB from
+ * itself, which hung USB until reboot). */
+static int usb_states_known;
+static int usb_ours_running_state, usb_mtp_stopped_state;
+
+static void usb_record_states(void)
+{
+	usb_ours_running_state = ksceUdcdGetDrvState(UVC_DRIVER_NAME);
+	usb_mtp_stopped_state = ksceUdcdGetDrvState("USB_MTP_Driver");
+	usb_states_known = usb_ours_running_state >= 0 &&
+			   usb_mtp_stopped_state >= 0;
+	DLOG("reference states: VITASYNC 0x%08X (running), "
+	     "USB_MTP_Driver 0x%08X (stopped), callback says running %d\n",
+	     usb_ours_running_state, usb_mtp_stopped_state, usb_driver_running);
+}
+
+#ifdef DEBUG
+/* Our driver is still the one on the port: the callback says running and
+ * its state is unchanged. */
+static int usb_ours_running(void)
+{
+	return usb_driver_running &&
+	       ksceUdcdGetDrvState(UVC_DRIVER_NAME) == usb_ours_running_state;
+}
+#endif
+
+/* Our driver was stopped: both signals must agree. If either one doesn't
+ * behave as expected, no retake happens, which is safe. */
+static int usb_ours_evicted(void)
+{
+	int st = ksceUdcdGetDrvState(UVC_DRIVER_NAME);
+
+	return !usb_driver_running && st >= 0 && st != usb_ours_running_state;
+}
+
+static int usb_mtp_restarted(void)
+{
+	int st = ksceUdcdGetDrvState("USB_MTP_Driver");
+
+	return st >= 0 && st != usb_mtp_stopped_state;
+}
+
+#ifdef DEBUG
+/* While VitaShell's USB transfer is open, the PC has ux0: mounted as a raw
+ * disk, and writing the log to it from here could corrupt the card.
+ * VitaShell stops both our driver and MTP while the transfer is open, so
+ * only write while our driver still runs or MTP is back; until then lines
+ * stay buffered. */
+static void dbg_flush_if_safe(void)
+{
+	if (usb_states_known && (usb_ours_running() || usb_mtp_restarted()))
+		log_flush();
+}
+#define DFLUSH_SAFE()	dbg_flush_if_safe()
+#else
+#define DFLUSH_SAFE()	((void)0)
+#endif
+
+/* After VitaShell's USB transfer closes, the port is back in MTP mode
+ * (VitaShell restarts only MTP). Clear what the eviction left behind, then
+ * take the port again as at boot. If that fails, give it back to MTP so the
+ * port is never left dead. */
+static int usb_retake(void)
+{
+	int ret;
+
+	stream = 0;
+	pc_control_release();
+	/* A heartbeat in flight when the port was taken may never complete,
+	 * which would leave ep2_busy set and stop all later heartbeats. */
+	ksceUdcdReqCancelAll(&endpoints[2]);
+	ep2_busy = 0;
+	memcpy(&uvc_probe_control_setting, &uvc_probe_control_setting_default,
+	       sizeof(uvc_probe_control_setting));
+
+	DLOG("retaking USB\n");
+	ret = usb_takeover();
+	if (ret < 0) {
+		DLOG("retake failed (0x%08X), giving USB back to MTP\n", ret);
+		usb_restore_mtp();
+	} else {
+		DLOG("retake OK\n");
+	}
+	DFLUSH_SAFE();
+	return ret;
+}
+
+#define USB_CHECK_INTERVAL_US	1000000	/* driver states read once a second */
+#define USB_FREE_CHECKS		2	/* checks in a row before retaking */
+#define USB_RETAKE_MAX_FAILS	3	/* then stop trying until next load */
+
 static int uvc_thread(SceSize args, void *argp)
 {
 	SceUID display_vblank_cb_uid;
 
 	stream = 0;
-	uvc_start();
+	DLOG("uvc_thread: started\n");
+	/* Retaking the port is only armed once the boot takeover worked and
+	 * the reference states could be read. */
+	if (DCALL(uvc_start()) == 0)
+		usb_record_states();
+	int usb_free_checks = 0, usb_retake_fails = 0;
+	SceUInt64 next_usb_check = 0;
+	/* First write to ux0:. By now (15 s+ after start) henlo has mounted
+	 * the SD2Vita, so the log lands on the card the PC mounts. */
+	DFLUSH();
+
+#ifdef DEBUG
+	unsigned int dbg_attach_seen = 0, dbg_detach_seen = 0;
+	int dbg_stream_seen = 0, dbg_rx_logged = 0, dbg_last_frame_err = 0;
+	unsigned int dbg_rx_err_seen = 0;
+	int dbg_ours_seen = -1, dbg_mtp_seen = -1, dbg_running_seen = -1;
+#endif
 
 	display_vblank_cb_uid = ksceKernelCreateCallback("uvc_display_vblank", 0,
 							 display_vblank_cb_func, NULL);
@@ -2191,6 +2349,42 @@ static int uvc_thread(SceSize args, void *argp)
 		if (now - last_hb >= 500000) { /* heartbeat every ~500 ms */
 			last_hb = now;
 			pc_hid_send_input_heartbeat();
+		}
+
+		/* Take the port back once VitaShell's USB transfer has closed.
+		 * Opening it stops every udcd driver (ours too) and MTP, and
+		 * closing it restarts only MTP. So "ours evicted + MTP back"
+		 * can only mean it has closed. */
+		if (usb_states_known && usb_retake_fails < USB_RETAKE_MAX_FAILS &&
+		    now >= next_usb_check) {
+			next_usb_check = now + USB_CHECK_INTERVAL_US;
+#ifdef DEBUG
+			{
+				int ours = ksceUdcdGetDrvState(UVC_DRIVER_NAME);
+				int mtp = ksceUdcdGetDrvState("USB_MTP_Driver");
+
+				if (ours != dbg_ours_seen || mtp != dbg_mtp_seen ||
+				    usb_driver_running != dbg_running_seen) {
+					dbg_ours_seen = ours;
+					dbg_mtp_seen = mtp;
+					dbg_running_seen = usb_driver_running;
+					DLOG("states: VITASYNC 0x%08X, USB_MTP_Driver 0x%08X, "
+					     "callback says running %d (starts %u, stops %u)\n",
+					     ours, mtp, dbg_running_seen,
+					     dbg_drv_start_n, dbg_drv_stop_n);
+					DFLUSH_SAFE();
+				}
+			}
+#endif
+			if (usb_ours_evicted() && usb_mtp_restarted()) {
+				if (++usb_free_checks >= USB_FREE_CHECKS) {
+					usb_free_checks = 0;
+					if (usb_retake() < 0)
+						usb_retake_fails++;
+				}
+			} else {
+				usb_free_checks = 0;
+			}
 		}
 
 		/* Watchdog: if reports stop arriving for >1 s while a
@@ -2302,8 +2496,57 @@ static int uvc_thread(SceSize args, void *argp)
 		if (kill_hold > 0)
 			kill_hold--;
 
-		if (ret == 0 && stream && kill_hold == 0)
-			send_frame();
+		if (ret == 0 && stream && kill_hold == 0) {
+			int sf = send_frame();
+#ifdef DEBUG
+			/* Log each new error code once, not every frame. */
+			if (sf < 0 && sf != dbg_last_frame_err) {
+				DLOG("send_frame = 0x%08X\n", sf);
+				DFLUSH_SAFE();
+			}
+			if (sf < 0)
+				dbg_last_frame_err = sf;
+#else
+			(void)sf;
+#endif
+		}
+
+#ifdef DEBUG
+		if (dbg_attach_n != dbg_attach_seen) {
+			dbg_attach_seen = dbg_attach_n;
+			DLOG("attach #%u (usb_version %d)\n",
+			     dbg_attach_seen, dbg_attach_usb_version);
+			DFLUSH_SAFE();
+		}
+		if (dbg_detach_n != dbg_detach_seen) {
+			dbg_detach_seen = dbg_detach_n;
+			DLOG("detach #%u\n", dbg_detach_seen);
+			DFLUSH_SAFE();
+		}
+		if (stream != dbg_stream_seen) {
+			dbg_stream_seen = stream;
+			if (stream)
+				DLOG("stream on: format %u frame %u interval %u\n",
+				     uvc_probe_control_setting.bFormatIndex,
+				     uvc_probe_control_setting.bFrameIndex,
+				     (unsigned int)uvc_probe_control_setting.dwFrameInterval);
+			else
+				DLOG("stream off\n");
+			dbg_last_frame_err = 0;
+			DFLUSH_SAFE();
+		}
+		if (!dbg_rx_logged && pc_hid_recv_ok > 0) {
+			dbg_rx_logged = 1;
+			DLOG("first HID report received\n");
+			DFLUSH_SAFE();
+		}
+		/* Receive errors can repeat fast: report at heartbeat pace. */
+		if (now == last_hb && pc_hid_recv_err != dbg_rx_err_seen) {
+			dbg_rx_err_seen = pc_hid_recv_err;
+			DLOG("HID receive errors: %u\n", dbg_rx_err_seen);
+			DFLUSH_SAFE();
+		}
+#endif
 		/* NB : PAS de uvc_frame_term() sur timeout ! L'ancien code
 		 * libérait le buffer toutes les 8 ms d'inactivité, parfois
 		 * pendant que le DMA USB relisait encore le dernier frame
@@ -2368,47 +2611,77 @@ static int uvc_frame_term()
 	return 0;
 }
 
-int uvc_start(void)
+/* Take the USB port: stop the system's drivers (MTP...) and start ours.
+ * Used at boot by uvc_start, and again by usb_retake after VitaShell's USB
+ * transfer had taken the port. */
+static int usb_takeover(void)
 {
 	int ret;
 
-	ksceDisplayWaitSetFrameBufCB();
-
-	ksceKernelDelayThreadCB(15 * 1000 * 1000);
-
-	ret = ksceUdcdDeactivate();
+	ret = DCALL(ksceUdcdDeactivate());
 	if (ret < 0 && ret != SCE_UDCD_ERROR_INVALID_ARGUMENT) {
 		return ret;
 	}
 
-	ksceUdcdStop("USB_MTP_Driver", 0, NULL);
-	ksceUdcdStop("USBPSPCommunicationDriver", 0, NULL);
-	ksceUdcdStop("USBSerDriver", 0, NULL);
-	ksceUdcdStop("USBDeviceControllerDriver", 0, NULL);
+	DCALL(ksceUdcdStop("USB_MTP_Driver", 0, NULL));
+	DCALL(ksceUdcdStop("USBPSPCommunicationDriver", 0, NULL));
+	DCALL(ksceUdcdStop("USBSerDriver", 0, NULL));
+	DCALL(ksceUdcdStop("USBDeviceControllerDriver", 0, NULL));
 
-	ret = ksceUdcdStart("USBDeviceControllerDriver", 0, NULL);
+	ret = DCALL(ksceUdcdStart("USBDeviceControllerDriver", 0, NULL));
 	if (ret < 0) {
 		return ret;
 	}
 
-	ret = ksceUdcdStart(UVC_DRIVER_NAME, 0, NULL);
+	ret = DCALL(ksceUdcdStart(UVC_DRIVER_NAME, 0, NULL));
 	if (ret < 0) {
 		goto err_start_uvc_driver;
 	}
 
-	ret = ksceUdcdActivate(UVC_USB_PID);
+	ret = DCALL(ksceUdcdActivate(UVC_USB_PID));
 	if (ret < 0) {
 		goto err_activate;
 	}
 
-	ret = uvc_frame_req_init();
+	return 0;
+
+err_activate:
+	ksceUdcdStop(UVC_DRIVER_NAME, 0, NULL);
+err_start_uvc_driver:
+	ksceUdcdStop("USBDeviceControllerDriver", 0, NULL);
+	return ret;
+}
+
+/* Give the port back to the system's MTP mode, as uvc_stop does. */
+static void usb_restore_mtp(void)
+{
+	DCALL(ksceUdcdStart("USBDeviceControllerDriver", 0, NULL));
+	DCALL(ksceUdcdStart("USB_MTP_Driver", 0, NULL));
+	DCALL(ksceUdcdActivate(0x4E4));
+}
+
+int uvc_start(void)
+{
+	int ret;
+
+	DCALL(ksceDisplayWaitSetFrameBufCB());
+
+	ksceKernelDelayThreadCB(15 * 1000 * 1000);
+	DLOG("uvc_start: 15 s delay over\n");
+
+	ret = usb_takeover();
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = DCALL(uvc_frame_req_init());
 	if (ret < 0) {
 		goto err_alloc_uvc_frame_req;
 	}
 
 	/* Initialisation PRÉCOCE du frame buffer (AVANT 1er vblank)
 	 * pour éviter tout crash sur frame LiveArea au format imprévu. */
-	ret = uvc_frame_init(UVC_FRAME_PADDING_SIZE + VIDEO_FRAME_SIZE_NV12(960, 544));
+	ret = DCALL(uvc_frame_init(UVC_FRAME_PADDING_SIZE + VIDEO_FRAME_SIZE_NV12(960, 544)));
 	if (ret < 0) {
 		goto err_alloc_uvc_frame_req;
 	}
@@ -2420,9 +2693,7 @@ int uvc_start(void)
 
 err_alloc_uvc_frame_req:
 	ksceUdcdDeactivate();
-err_activate:
 	ksceUdcdStop(UVC_DRIVER_NAME, 0, NULL);
-err_start_uvc_driver:
 	ksceUdcdStop("USBDeviceControllerDriver", 0, NULL);
 	return ret;
 }
@@ -2485,17 +2756,26 @@ int module_start(SceSize argc, const void *args)
 	int ret;
 	tai_module_info_t SceUdcd_modinfo;
 
-	SceUdcd_modinfo.size = sizeof(SceUdcd_modinfo);
-	taiGetModuleInfoForKernel(KERNEL_PID, "SceUdcd", &SceUdcd_modinfo);
+#ifdef DEBUG
+	log_reset();
+#endif
+	DLOG("VitaSync debug build " __DATE__ " " __TIME__ "\n");
 
-	SceUdcd_sub_01E1128C_hook_uid = taiHookFunctionOffsetForKernel(KERNEL_PID,
+	SceUdcd_modinfo.size = sizeof(SceUdcd_modinfo);
+	DCALL(taiGetModuleInfoForKernel(KERNEL_PID, "SceUdcd", &SceUdcd_modinfo));
+
+	SceUdcd_sub_01E1128C_hook_uid = DCALL(taiHookFunctionOffsetForKernel(KERNEL_PID,
 		&SceUdcd_sub_01E1128C_ref, SceUdcd_modinfo.modid, 0,
-		0x01E1128C - 0x01E10000, 1, SceUdcd_sub_01E1128C_hook_func);
+		0x01E1128C - 0x01E10000, 1, SceUdcd_sub_01E1128C_hook_func));
 
 	/* Touch hooks are installed lazily once the PC app talks to us,
 	 * and fully removed again when it goes silent (watchdog below). */
 	touch_hooks_install();
 	touch_hooks_wanted = 1;
+	DLOG("touch hooks: 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X 0x%08X\n",
+	     touch_peek_hook_uid, touch_peek_region_hook_uid,
+	     touch_read_hook_uid, touch_read_region_hook_uid,
+	     touch_peek2_hook_uid, touch_read2_hook_uid);
 
 #if ENABLE_AUDIO_CAPTURE && ENABLE_AUDIO_HOOKTRY
 	/* Hooks audio AU BOOT (architecture EQVita) : SceAudio est déjà
@@ -2525,19 +2805,19 @@ int module_start(SceSize argc, const void *args)
 #endif
 #endif
 
-	uvc_thread_id = ksceKernelCreateThread("uvc_thread", uvc_thread,
-					       0x3C, 0x1000, 0, 0x10000, 0);
+	uvc_thread_id = DCALL(ksceKernelCreateThread("uvc_thread", uvc_thread,
+					       0x3C, 0x1000, 0, 0x10000, 0));
 	if (uvc_thread_id < 0) {
 		goto err_return;
 	}
 
-	uvc_event_flag_id = ksceKernelCreateEventFlag("uvc_event_flag", 0,
-						      0, NULL);
+	uvc_event_flag_id = DCALL(ksceKernelCreateEventFlag("uvc_event_flag", 0,
+						      0, NULL));
 	if (uvc_event_flag_id < 0) {
 		goto err_destroy_thread;
 	}
 
-	ret = ksceUdcdRegister(&uvc_udcd_driver);
+	ret = DCALL(ksceUdcdRegister(&uvc_udcd_driver));
 	if (ret < 0) {
 		goto err_delete_event_flag;
 	}
@@ -2546,23 +2826,29 @@ int module_start(SceSize argc, const void *args)
 
 	/* Worker audio d�di� : son �chec ne doit pas emp�cher le
 	 * chargement du module (la vid�o/tactile continuent sans lui). */
-	aring_mutex = ksceKernelCreateMutex("aring_mut", 0, 0, NULL);
-	if (aring_mutex < 0)
+	aring_mutex = DCALL(ksceKernelCreateMutex("aring_mut", 0, 0, NULL));
+	if (aring_mutex < 0) {
+		DFLUSH();
 		return SCE_KERNEL_START_FAILED;
+	}
 
 	audio_thread_run = 1;
-	audio_thread_id = ksceKernelCreateThread("aud_send",
+	audio_thread_id = DCALL(ksceKernelCreateThread("aud_send",
 						 audio_send_thread,
 						 0x3C, 0x1000, 0,
-						 0x10000, 0);
+						 0x10000, 0));
 	if (audio_thread_id >= 0)
 		ksceKernelStartThread(audio_thread_id, 0, NULL);
 	else
 		audio_thread_id = -1;
 
+	/* Last line before uvc_thread runs: from here on only that thread
+	 * writes to the log buffer. */
+	DLOG("module_start: starting uvc_thread\n");
 	uvc_thread_run = 1;
 	ret = ksceKernelStartThread(uvc_thread_id, 0, NULL);
 	if (ret < 0) {
+		DLOG("ksceKernelStartThread(uvc_thread) = 0x%08X\n", ret);
 		goto err_unregister;
 	}
 
@@ -2575,6 +2861,7 @@ err_delete_event_flag:
 err_destroy_thread:
 	ksceKernelDeleteThread(uvc_thread_id);
 err_return:
+	DFLUSH(); /* may fail if ux0: isn't mounted yet */
 	return SCE_KERNEL_START_FAILED;
 }
 

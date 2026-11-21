@@ -138,6 +138,9 @@ static unsigned char pc_hid_report[PC_HID_REPORT_SIZE] __attribute__((aligned(64
 static SceUdcdDeviceRequest pc_hid_recv_req;
 static volatile int pc_control_active;
 static volatile unsigned int pc_buttons;
+/* PS (home) button, report byte 11 bit 0. It is a kernel button: it can
+ * only be emulated through the kernelButtons mask. */
+static volatile int pc_ps;
 static volatile unsigned char pc_lx = 128, pc_ly = 128, pc_rx = 128, pc_ry = 128;
 static volatile unsigned int pc_hid_recv_ok;
 static volatile unsigned int pc_hid_recv_err;
@@ -1088,10 +1091,12 @@ static void pc_control_apply(void)
      * (0x400/0x800) as a fallback. */
     {
         unsigned int b = pc_buttons | ((pc_buttons & 0x0300u) << 2);
+        /* PS only in the kernel mask: user masks can't carry it. */
+        unsigned int kb = b | (pc_ps ? SCE_CTRL_PSBUTTON : 0);
         ret_b = 0;
         for (slot = 1; slot <= 3; slot++) {
             ret_b |= ksceCtrlSetButtonEmulation(0, (unsigned char)slot,
-                                                b, b, 60);
+                                                b, kb, 60);
         }
     }
     pc_ret_button_emu = ret_b;
@@ -1104,6 +1109,7 @@ static void pc_control_release(void)
 
 	pc_control_active = 0;
 	pc_buttons = 0;
+	pc_ps = 0;
 	pc_lx = pc_ly = pc_rx = pc_ry = 128;
 	/* Session termin�e : on r�autorise un kill et on oublie l'ancien
 	 * PID (le jeu au premier plan peut avoir chang� entre-temps).
@@ -1131,6 +1137,7 @@ static void pc_hid_apply_report(const unsigned char *report)
 
 	pc_buttons = (unsigned int)report[1] |
 	             ((unsigned int)report[2] << 8);
+	pc_ps = report[11] & 0x01;
 	pc_lx = report[3];
 	pc_ly = report[4];
 	pc_rx = report[5];
@@ -1351,7 +1358,7 @@ static void pc_hid_send_input_heartbeat(void)
 	                         (touch_read_region_hook_uid > 0 ? 8 : 0) |
 	                         (touch_peek2_hook_uid > 0 ? 16 : 0) |
 	                         (touch_read2_hook_uid > 0 ? 32 : 0));
-	hb[29] = pc_touch_active ? 1 : 0;
+	hb[29] = (pc_touch_active ? 1 : 0) | (pc_ps ? 2 : 0);
 	hb[30] = (unsigned char)(pc_touch_x & 0xFF);
 	hb[31] = (unsigned char)(pc_touch_y & 0xFF);
 	hb[32] = h_peek;
@@ -1425,7 +1432,7 @@ static void pc_hid_send_input_heartbeat(void)
 	/* NULLs (appels bloquants) dans le quartet haut de hb[46] */
 	hb[46] = (unsigned char)((hb[46] & 0x0F) |
 		 ((n_null_calls > 15 ? 15 : n_null_calls) << 4));
-	hb[63] = 89; /* build id */
+	hb[63] = 90; /* build id: 90 = PS button (report byte 11) */
 
 	ep2_try_send(hb);
 	usb_audio_ok_cnt = 0;

@@ -69,7 +69,7 @@ app from the command line: it saves the Vita's screen and sends input.
 
    ```bash
    ./linux/vitactl.py watch start     # screen kept in $XDG_RUNTIME_DIR/vitactl/latest.png
-   ./linux/vitactl.py press CROSS     # SELECT START UP RIGHT DOWN LEFT L R TRIANGLE CIRCLE CROSS SQUARE
+   ./linux/vitactl.py press CROSS     # SELECT START UP RIGHT DOWN LEFT L R TRIANGLE CIRCLE CROSS SQUARE PS
    ./linux/vitactl.py hold L R 2000
    ./linux/vitactl.py stick L 128 0 1000
    ./linux/vitactl.py touch 480 272   # screenshot pixels (960x544)

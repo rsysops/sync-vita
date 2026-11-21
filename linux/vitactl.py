@@ -32,7 +32,10 @@ BUTTONS = {
     "UP": 0x0010, "RIGHT": 0x0020, "DOWN": 0x0040, "LEFT": 0x0080,
     "L": 0x0100, "R": 0x0200,
     "TRIANGLE": 0x1000, "CIRCLE": 0x2000, "CROSS": 0x4000, "SQUARE": 0x8000,
+    # Not in the 16-bit mask: sent in report byte 11 (plugin build 90+).
+    "PS": 0x10000,
 }
+PS = BUTTONS["PS"]
 
 REPORT_ID_OUTPUT = 2      # PC -> Vita, 64 bytes on the wire
 REPORT_ID_HEARTBEAT = 1   # Vita -> PC, about every 500 ms
@@ -230,6 +233,7 @@ def report(buttons=0, lx=128, ly=128, rx=128, ry=128, touch=None, kill=False):
         r[7] = 0x01
         r[8], r[9] = tx & 0xFF, ty & 0xFF
         r[10] = ((tx >> 8) & 0x0F) | (((ty >> 8) & 0x0F) << 4)
+    r[11] = 0x01 if buttons & PS else 0
     r[18] = 1 if kill else 0
     return bytes(r)
 
@@ -352,11 +356,14 @@ def cmd_status():
         note = "" if watch_pid() else " (the plugin only sends it while video streams: watch start)"
         print(f"heartbeat: none within 1.5 s{note}")
         return
-    held = hb[7] | (hb[8] << 8)
+    # Byte 29: bit 0 touch down, bit 1 PS held (build 90+).
+    held = hb[7] | (hb[8] << 8) | (PS if hb[29] & 0x02 else 0)
     print(f"plugin: build {hb[63]}, video stream {'on' if hb[21] else 'off'}, "
           f"input {'active' if hb[2] else 'idle'}, {hb[3] | (hb[4] << 8)} reports received")
+    if hb[63] < 90:
+        print("  (this plugin build predates the PS button: press PS has no effect)")
     print(f"held by vitactl: {button_names(held)}; "
-          f"touch {'down' if hb[29] else 'up'}")
+          f"touch {'down' if hb[29] & 0x01 else 'up'}")
     # hb[9] is reused by the plugin for a debug probe, so only bits 8+ of
     # what the console sees are reliable: L and R (0x100, 0x200), L1/R1 copies,
     # and the face buttons.

@@ -1,0 +1,10 @@
+# VitaSync (PS Vita with the VitaSync plugin, USB 054c:1337).
+# Install: sudo cp linux/70-vitasync.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger
+
+# Let the logged-in user send input through the HID interface.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="1337", MODE="0660", TAG+="uaccess"
+
+# Keep the Vita's USB awake: when Linux suspends the idle device, the plugin
+# sees a detach and releases all input.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="054c", ATTR{idProduct}=="1337", TEST=="power/control", ATTR{power/control}="on"

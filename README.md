@@ -48,6 +48,40 @@ Executable: `windows\bin\Release\net8.0-windows10.0.22621.0\VitaSync.exe`
 User settings: `%APPDATA%\VitaSync\` (`sensitivity.txt`, `lang.txt`,
 `keymap.txt`, `tutoDone.txt`). The tutorial only appears once (via `tutoDone.txt`).
 
+## Linux
+
+On Linux, build the plugin with `./build-vita.sh` (Docker, `vitasdk/vitasdk:2026.08`;
+`./build-vita.sh DEBUG=1` adds a log in `ux0:dump/VitaSync_log.txt`).
+
+`linux/vitactl.py` (Python 3, standard library and `ffmpeg`) replaces the Windows
+app from the command line: it saves the Vita's screen and sends input.
+
+1. Once, let your user send input and keep the Vita's USB awake:
+
+   ```bash
+   sudo cp linux/70-vitasync.rules /etc/udev/rules.d/
+   sudo udevadm control --reload && sudo udevadm trigger
+   ```
+
+2. Start the video, then send input. Input also works without the video, but
+   `shot` and the heartbeat in `status` need it, and the plugin releases all
+   input when the stream stops.
+
+   ```bash
+   ./linux/vitactl.py watch start     # screen kept in $XDG_RUNTIME_DIR/vitactl/latest.png
+   ./linux/vitactl.py press CROSS     # SELECT START UP RIGHT DOWN LEFT L R TRIANGLE CIRCLE CROSS SQUARE
+   ./linux/vitactl.py hold L R 2000
+   ./linux/vitactl.py stick L 128 0 1000
+   ./linux/vitactl.py touch 480 272   # screenshot pixels (960x544)
+   ./linux/vitactl.py shot menu.png   # the next frame, taken after the last input
+   ./linux/vitactl.py run steps.txt   # one command per line, plus "wait ms"
+   ./linux/vitactl.py status          # devices, video, and what the plugin reports
+   ./linux/vitactl.py watch stop
+   ```
+
+Opening VitaShell's USB transfer takes USB away from the plugin; it takes USB
+back by itself a few seconds after the transfer is closed.
+
 ## Misc
 
 - `build` / `bin` folders intentionally ignored by Git (build artifacts).

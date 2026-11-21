@@ -6,11 +6,21 @@ send it buttons, sticks and touches over USB.
   vitactl.py press BTN... [ms]         tap buttons (default 150 ms)
   vitactl.py hold BTN... ms            hold buttons
   vitactl.py stick L|R x y ms          move a stick (0-255, 128 = centre)
-  vitactl.py touch x y [ms]            touch the front screen, in 960x544 pixels
+  vitactl.py touch [T] x y [ms]        one finger (default 150 ms)
+  vitactl.py touch2 [T] x1 y1 x2 y2 [ms]   two fingers
+  vitactl.py swipe [T] x1 y1 x2 y2 [ms]    one finger moving (default 300 ms)
+  vitactl.py pinch [T] x y d1 d2 [ms]      two fingers spreading from d1 to d2 apart
   vitactl.py shot NAME                 save the next screen frame as NAME
   vitactl.py run FILE                  run commands from FILE (plus "wait ms")
   vitactl.py kill                      quit the game (only games that read touch)
   vitactl.py status                    devices, watch, and what the Vita reports
+
+Buttons: SELECT START UP RIGHT DOWN LEFT L R TRIANGLE CIRCLE CROSS SQUARE,
+PS VOLUP VOLDOWN (plugin build 90+/91+), L3 R3 (PS TV and controllers only).
+
+Touch positions are screenshot pixels (960x544). T is optional:
+  --rear      the rear touchpad, at the point behind that screen pixel (build 91+)
+  --force N   pressure 1-128 (default 128)
 
 Input works with or without `watch`; `shot` needs it. The plugin releases
 all input when the video stream stops, so don't stop `watch` in the middle
@@ -27,15 +37,22 @@ import subprocess
 import sys
 import time
 
+# SceCtrl bit values. The first 16 bits go in report bytes 1-2.
 BUTTONS = {
-    "SELECT": 0x0001, "START": 0x0008,
+    "SELECT": 0x0001, "L3": 0x0002, "R3": 0x0004, "START": 0x0008,
     "UP": 0x0010, "RIGHT": 0x0020, "DOWN": 0x0040, "LEFT": 0x0080,
     "L": 0x0100, "R": 0x0200,
     "TRIANGLE": 0x1000, "CIRCLE": 0x2000, "CROSS": 0x4000, "SQUARE": 0x8000,
-    # Not in the 16-bit mask: sent in report byte 11 (plugin build 90+).
-    "PS": 0x10000,
+    # Kernel buttons: not in the 16-bit mask, sent as bits of report byte 11.
+    "PS": 0x10000, "VOLUP": 0x100000, "VOLDOWN": 0x200000,
 }
 PS = BUTTONS["PS"]
+KERNEL_BUTTON_BITS = {BUTTONS["PS"]: 0x01, BUTTONS["VOLUP"]: 0x02, BUTTONS["VOLDOWN"]: 0x04}
+
+FRONT, REAR = 0, 1
+FRONT_MAX_X, FRONT_MAX_Y = 1919, 1087   # front panel units (1920x1088)
+FORCE_DEFAULT = 128
+REAR_BOUNDS_FALLBACK = (0, 1919, 108, 889)   # min X, max X, min Y, max Y
 
 REPORT_ID_OUTPUT = 2      # PC -> Vita, 64 bytes on the wire
 REPORT_ID_HEARTBEAT = 1   # Vita -> PC, about every 500 ms
@@ -139,6 +156,16 @@ def stop_ffmpeg(pid):
             pass
 
 
+def recent_uvc_kernel_lines():
+    """The last uvcvideo kernel messages from the past minute, if readable."""
+    try:
+        out = subprocess.run(["journalctl", "-k", "--since=-60s", "--no-pager", "-q"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [l for l in out.splitlines() if "uvcvideo" in l][-3:]
+
+
 def watch_start():
     if watch_pid():
         print(f"watch already running; screen in {state_file('latest.png')}")
@@ -152,25 +179,30 @@ def watch_start():
            "-f", "v4l2", "-input_format", "nv12", "-video_size", f"{SCREEN_W}x{SCREEN_H}",
            "-i", video, "-vf", "fps=3",
            "-f", "image2", "-update", "1", "-atomic_writing", "1", latest]
-    # The video sometimes doesn't start on the first try (see README): retry.
-    for attempt in range(1, 4):
-        started = time.time()
-        with open(log_path, "w") as log:
-            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
-                                    stderr=subprocess.STDOUT, start_new_session=True)
-        with open(state_file("ffmpeg.pid"), "w") as f:
-            f.write(str(proc.pid))
-        while time.time() - started < 6 and proc.poll() is None:
-            age = frame_age()
-            if age is not None and age < time.time() - started:
-                print(f"watch started ({video}); screen in {latest}")
-                return
-            time.sleep(0.1)
-        stop_ffmpeg(proc.pid)
-        print(f"no frame on attempt {attempt}, retrying", file=sys.stderr)
+    # A single attempt: on 2026-11-21, three quick retries after the Vita
+    # stopped answering video setup requests were followed by a crash.
+    started = time.time()
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+    with open(state_file("ffmpeg.pid"), "w") as f:
+        f.write(str(proc.pid))
+    while time.time() - started < 8 and proc.poll() is None:
+        age = frame_age()
+        if age is not None and age < time.time() - started:
+            print(f"watch started ({video}); screen in {latest}")
+            return
+        time.sleep(0.1)
+    stop_ffmpeg(proc.pid)
     os.remove(state_file("ffmpeg.pid"))
-    tail = read_sysfs(log_path).splitlines()[-5:]
-    raise VitaError("video did not start after 3 attempts. ffmpeg said:\n  " + "\n  ".join(tail))
+    tail = read_sysfs(log_path).splitlines()[-3:]
+    kernel = recent_uvc_kernel_lines()
+    raise VitaError(
+        "video did not start. ffmpeg said:\n  " + "\n  ".join(tail) +
+        ("\nkernel said:\n  " + "\n  ".join(kernel) if kernel else "") +
+        "\nDon't retry in a loop (repeated attempts once crashed the Vita). "
+        "Unplug and replug the cable, then try once more; if it still fails, "
+        "power the Vita off and on and run henlo.")
 
 
 def watch_stop():
@@ -223,17 +255,32 @@ def shot(name):
 
 # ---- input ----
 
-def report(buttons=0, lx=128, ly=128, rx=128, ry=128, touch=None, kill=False):
+# Report layout (64 bytes): 0 report ID, 1-2 buttons, 3-6 sticks, 7 touch
+# flags, 8-10 front finger 1, 11 kernel buttons, 12-14 front finger 2,
+# 15-17 rear finger 1, 18 kill, 19-21 rear finger 2, 22/23 front/rear force.
+# Each finger: 12-bit X and Y in panel units, packed in 3 bytes.
+FINGER_SLOTS = {FRONT: ((0x01, 8), (0x02, 12)), REAR: ((0x04, 15), (0x08, 19))}
+FORCE_BYTE = {FRONT: 22, REAR: 23}
+
+
+def report(buttons=0, lx=128, ly=128, rx=128, ry=128, fingers=None, forces=None,
+           kill=False):
+    """fingers: {FRONT|REAR: [(x, y), ...]} in panel units, at most 2 per panel.
+    forces: {FRONT|REAR: 1-128}; missing means the plugin's default (128)."""
     r = bytearray(64)
     r[0] = REPORT_ID_OUTPUT
     r[1], r[2] = buttons & 0xFF, (buttons >> 8) & 0xFF
     r[3], r[4], r[5], r[6] = lx, ly, rx, ry
-    if touch:
-        tx, ty = touch
-        r[7] = 0x01
-        r[8], r[9] = tx & 0xFF, ty & 0xFF
-        r[10] = ((tx >> 8) & 0x0F) | (((ty >> 8) & 0x0F) << 4)
-    r[11] = 0x01 if buttons & PS else 0
+    for port, points in (fingers or {}).items():
+        for (flag, off), (tx, ty) in zip(FINGER_SLOTS[port], points):
+            r[7] |= flag
+            r[off], r[off + 1] = tx & 0xFF, ty & 0xFF
+            r[off + 2] = ((tx >> 8) & 0x0F) | (((ty >> 8) & 0x0F) << 4)
+    for port, force in (forces or {}).items():
+        r[FORCE_BYTE[port]] = force
+    for bit, flag in KERNEL_BUTTON_BITS.items():
+        if buttons & bit:
+            r[11] |= flag
     r[18] = 1 if kill else 0
     return bytes(r)
 
@@ -306,13 +353,114 @@ def cmd_stick(args):
     send([(rep, secs)])
 
 
+def rear_bounds():
+    """Rear touchpad active area (min X, max X, min Y, max Y) in panel units,
+    as the plugin reads it from the Vita (heartbeat bytes 38-45, build 91+).
+    Cached in the state folder: it never changes."""
+    cache = state_file("rear_bounds")
+    try:
+        with open(cache) as f:
+            b = tuple(int(v) for v in f.read().split())
+        if len(b) == 4:
+            return b
+    except (OSError, ValueError):
+        pass
+    hb = read_heartbeat(need_hidraw())
+    if not hb:
+        # No heartbeat: the values a Vita reported on 2026-11-21
+        # (build 92 debug log: X 0-1919, Y 108-889).
+        return REAR_BOUNDS_FALLBACK
+    b = tuple(int.from_bytes(hb[i:i + 2], "little", signed=True) for i in (38, 40, 42, 44))
+    if hb[63] < 91 or b[1] <= b[0] or b[3] <= b[2]:
+        raise VitaError(f"the plugin (build {hb[63]}) doesn't report the rear touchpad; "
+                        "--rear needs build 91 or later")
+    with open(cache, "w") as f:
+        f.write(" ".join(str(v) for v in b))
+    return b
+
+
+def to_panel(port, x, y):
+    """Screenshot pixel -> panel units. The rear maps the whole screen onto
+    the rear's active area: the point behind that screen pixel."""
+    x = min(max(round(x), 0), SCREEN_W - 1)
+    y = min(max(round(y), 0), SCREEN_H - 1)
+    if port == FRONT:
+        return min(x * TOUCH_SCALE, FRONT_MAX_X), min(y * TOUCH_SCALE, FRONT_MAX_Y)
+    min_x, max_x, min_y, max_y = rear_bounds()
+    return (min_x + round(x * (max_x - min_x) / (SCREEN_W - 1)),
+            min_y + round(y * (max_y - min_y) / (SCREEN_H - 1)))
+
+
+def parse_touch_args(args, usage, counts):
+    """Pull --rear and --force N out of args; check the positional count."""
+    port, forces, pos = FRONT, {}, []
+    it = iter(args)
+    for a in it:
+        if a == "--rear":
+            port = REAR
+        elif a == "--force":
+            forces = {"force": parse_int(next(it, ""), "force", 1, 128)}
+        else:
+            pos.append(a)
+    if len(pos) not in counts:
+        raise VitaError("usage: " + usage)
+    return port, {port: forces["force"]} if forces else {}, pos
+
+
+def parse_point(xs, ys):
+    return (parse_int(xs, "x", 0, SCREEN_W - 1), parse_int(ys, "y", 0, SCREEN_H - 1))
+
+
+def touch_steps(port, forces, path, secs, step_s=0.016):
+    """Reports for fingers following path(t) -> [(x, y), ...] for t in 0..1."""
+    n = max(1, round(secs / step_s))
+    steps = []
+    for i in range(n + 1):
+        pts = [to_panel(port, x, y) for x, y in path(i / n)]
+        steps.append((report(fingers={port: pts}, forces=forces), secs / (n + 1)))
+    return steps
+
+
 def cmd_touch(args):
-    if len(args) not in (2, 3):
-        raise VitaError("usage: touch x y [ms]  (x 0-959, y 0-543, screenshot pixels)")
-    x = parse_int(args[0], "x", 0, SCREEN_W - 1)
-    y = parse_int(args[1], "y", 0, SCREEN_H - 1)
-    secs = parse_ms(args[2]) if len(args) == 3 else 0.15
-    send([(report(touch=(x * TOUCH_SCALE, y * TOUCH_SCALE)), secs)])
+    port, forces, pos = parse_touch_args(
+        args, "touch [--rear] [--force N] x y [ms]  (screenshot pixels 960x544)", (2, 3))
+    p = parse_point(pos[0], pos[1])
+    secs = parse_ms(pos[2]) if len(pos) == 3 else 0.15
+    send([(report(fingers={port: [to_panel(port, *p)]}, forces=forces), secs)])
+
+
+def cmd_touch2(args):
+    port, forces, pos = parse_touch_args(
+        args, "touch2 [--rear] [--force N] x1 y1 x2 y2 [ms]", (4, 5))
+    p1, p2 = parse_point(pos[0], pos[1]), parse_point(pos[2], pos[3])
+    secs = parse_ms(pos[4]) if len(pos) == 5 else 0.15
+    pts = [to_panel(port, *p1), to_panel(port, *p2)]
+    send([(report(fingers={port: pts}, forces=forces), secs)])
+
+
+def cmd_swipe(args):
+    port, forces, pos = parse_touch_args(
+        args, "swipe [--rear] [--force N] x1 y1 x2 y2 [ms]", (4, 5))
+    (x1, y1), (x2, y2) = parse_point(pos[0], pos[1]), parse_point(pos[2], pos[3])
+    secs = parse_ms(pos[4]) if len(pos) == 5 else 0.3
+    send(touch_steps(port, forces,
+                     lambda t: [(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)], secs))
+
+
+def cmd_pinch(args):
+    port, forces, pos = parse_touch_args(
+        args, "pinch [--rear] [--force N] x y d1 d2 [ms]  "
+              "(d1 -> d2: horizontal spacing in pixels; d2 > d1 zooms in)", (4, 5))
+    x, y = parse_point(pos[0], pos[1])
+    d1 = parse_int(pos[2], "d1", 0, SCREEN_W - 1)
+    d2 = parse_int(pos[3], "d2", 0, SCREEN_W - 1)
+    secs = parse_ms(pos[4]) if len(pos) == 5 else 0.5
+
+    def path(t):
+        half = (d1 + (d2 - d1) * t) / 2
+        return [(x - half, y), (x + half, y)]
+
+    send(touch_steps(port, forces, path, secs))
 
 
 def cmd_kill():
@@ -353,17 +501,28 @@ def cmd_status():
         return
     hb = read_heartbeat(hid)
     if not hb:
-        note = "" if watch_pid() else " (the plugin only sends it while video streams: watch start)"
+        note = "" if watch_pid() else " (it may only arrive while video streams: watch start)"
         print(f"heartbeat: none within 1.5 s{note}")
         return
-    # Byte 29: bit 0 touch down, bit 1 PS held (build 90+).
-    held = hb[7] | (hb[8] << 8) | (PS if hb[29] & 0x02 else 0)
-    print(f"plugin: build {hb[63]}, video stream {'on' if hb[21] else 'off'}, "
+    # Byte 29: bit 0 front finger, 1 PS, 2 VOL+, 3 VOL-, 4 rear finger.
+    held = hb[7] | (hb[8] << 8)
+    for bit, name in ((0x02, "PS"), (0x04, "VOLUP"), (0x08, "VOLDOWN")):
+        if hb[29] & bit:
+            held |= BUTTONS[name]
+    build = hb[63]
+    print(f"plugin: build {build}, video stream {'on' if hb[21] else 'off'}, "
           f"input {'active' if hb[2] else 'idle'}, {hb[3] | (hb[4] << 8)} reports received")
-    if hb[63] < 90:
-        print("  (this plugin build predates the PS button: press PS has no effect)")
+    if build < 91:
+        print(f"  (build {build} predates " +
+              ("PS, " if build < 90 else "") +
+              "VOLUP/VOLDOWN, two fingers, the rear touchpad and pressure)")
     print(f"held by vitactl: {button_names(held)}; "
-          f"touch {'down' if hb[29] & 0x01 else 'up'}")
+          f"front touch {'down' if hb[29] & 0x01 else 'up'}" +
+          (f", rear touch {'down' if hb[29] & 0x10 else 'up'}" if build >= 91 else ""))
+    if build >= 91:
+        b = [int.from_bytes(hb[i:i + 2], "little", signed=True) for i in (38, 40, 42, 44)]
+        print(f"touch reads patched in the last 0.5 s: front {hb[30]}, rear {hb[31]}; "
+              f"rear touchpad X {b[0]}-{b[1]}, Y {b[2]}-{b[3]}")
     # hb[9] is reused by the plugin for a debug probe, so only bits 8+ of
     # what the console sees are reliable: L and R (0x100, 0x200), L1/R1 copies,
     # and the face buttons.
@@ -396,6 +555,12 @@ def run_command(argv):
         cmd_stick(args)
     elif cmd == "touch":
         cmd_touch(args)
+    elif cmd == "touch2":
+        cmd_touch2(args)
+    elif cmd == "swipe":
+        cmd_swipe(args)
+    elif cmd == "pinch":
+        cmd_pinch(args)
     elif cmd == "shot":
         if len(args) != 1:
             raise VitaError("usage: shot NAME")

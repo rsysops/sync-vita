@@ -4,11 +4,13 @@ Project facts for the `vita-testing` skill.
 
 ## Folder on ux0:
 
-`dump/` (`ux0:dump/`), where debug builds write their log.
+`downloads/` (`ux0:downloads/`). Debug builds write their log to
+`ur0:data/VitaSync_log.txt`, which USB transfer doesn't expose: the user
+copies it to `ux0:downloads/` in VitaShell before opening USB transfer.
 
 ## Flavours
 
-Default: **debug**.
+Default: **release**.
 
 | flavour | build command | build output |
 |---|---|---|
@@ -18,9 +20,10 @@ Default: **debug**.
 Both flavours write the same file, so the last build wins. There's no `.vpk`,
 `.self`, title ID or app: VitaSync is a kernel plugin.
 
-Building the release flavour prints 4 warnings that are already in the code
-(a dropped `const` and an always-true check in `main.c`, among others), plus
-unused-code warnings from the disabled audio code. Only new warnings count.
+Both flavours print 4 warnings that are already in the code (a dropped `const`
+and always-true checks in `main.c`, among others), plus unused-code warnings
+from the disabled audio code. Only new warnings count. `build-vita.sh` fails
+if the plugin imports the user-mode `SceLibKernel`.
 
 ## Destination
 
@@ -32,19 +35,26 @@ Copy the `.skprx` to `downloads/`. The user then:
    exit".
 
 The plugin takes over USB about 40 s after that (`lsusb`: `054c:1337`, video
-on the `/dev/video*` named "PSVita", HID on a `/dev/hidraw*`).
+on the `/dev/video*` named "PSVita", HID on a `/dev/hidraw*`). With the
+release build, `vitactl.py status` shows the build number (95 as of
+2026-11-21).
 
-Opening VitaShell's USB mode stops the plugin. Closing it brings the plugin
+Opening VitaShell's USB transfer stops the plugin. Closing it brings the plugin
 back by itself within a few seconds (`1337` again), with no reboot needed.
-Builds without this (before 2026-11-21 evening) needed a reboot and henlo.
+
+**Known issue (TODO.md):** once `vitactl.py` has sent input or run `status` in
+a boot, opening USB transfer can freeze the Vita, which crashes 30–60 s later.
+Video alone is fine. In such a boot, copy over VitaShell's FTP or reboot first.
+After a freeze: hold power to force it off.
 
 ## Results
 
 `RESULTS="VitaSync_log.txt"`, `DEST=/tmp/sync-vita-...`
 
-- `VitaSync_log.txt` (debug flavour only): the plugin's startup and USB events.
-  It's written from scratch each time the plugin loads, so it only covers the
-  latest load.
+- `VitaSync_log.txt` (debug flavour only), copied by the user from
+  `ur0:data/` to `ux0:downloads/`: the plugin's startup and USB events. Each
+  plugin load starts it afresh, so after a freeze the user boots with **L**
+  held when leaving henlo's menu (no plugins), then copies it.
 
 ## Never touched
 
@@ -53,7 +63,8 @@ gamesd, PSVshell, kubridge). Nothing else on `ux0:` belongs to this project.
 
 ## What to test from
 
-`~/Desktop/vitasync-handoff.md`, "How to check it works".
+`~/Desktop/vitasync-handoff.md`, "How to check it works". For the USB
+transfer freeze: `TODO.md`.
 
 ## Reading results
 
@@ -68,16 +79,19 @@ gamesd, PSVshell, kubridge). Nothing else on `ux0:` belongs to this project.
   `USBSerDriver` returns `0x80243002` when they weren't running, which is
   normal. `uvc_start() = 0x00000000` means the plugin owns USB;
 - `reference states`: the raw driver states recorded right after the boot
-  takeover. Later `states:` lines are compared with these, and are written
-  whenever a state or the driver's start/stop callbacks change;
+  takeover (`0x02` running, `0x01` stopped). Later `states:` lines are
+  written whenever a state or the driver's start/stop callbacks change;
+- `rear panel`: the rear touchpad's active area, read from the Vita;
 - `retaking USB`, its steps, then `retake OK` or `retake failed`;
 - events: `attach` and `detach`, `stream on` (with format, frame index and
   frame interval in 100 ns units) and `stream off`, `first HID report
   received`, `HID receive errors: N` (one per detach is normal), and
-  `send_frame = <error>`.
-
-Lines produced while USB mode is open are held in memory and written after it
-closes, so the card is never written while the PC has it mounted.
+  `send_frame = <error>`;
+- `bc:` lines, from the breadcrumb logger thread: `bc: ep0 ...` for each
+  setup request from the PC, and a summary (attach/detach/video-abort steps,
+  driver start/stop counts, EP3 receives, where `uvc_thread` is) on each
+  change and every 5 s. As of build 94 these stop about 25 s after the PC
+  connects; see TODO.md.
 
 ## Keeping captures
 

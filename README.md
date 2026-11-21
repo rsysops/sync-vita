@@ -69,10 +69,15 @@ app from the command line: it saves the Vita's screen and sends input.
 
    ```bash
    ./linux/vitactl.py watch start     # screen kept in $XDG_RUNTIME_DIR/vitactl/latest.png
-   ./linux/vitactl.py press CROSS     # SELECT START UP RIGHT DOWN LEFT L R TRIANGLE CIRCLE CROSS SQUARE PS
+   ./linux/vitactl.py press CROSS     # SELECT START UP RIGHT DOWN LEFT L R TRIANGLE CIRCLE CROSS SQUARE
+                                      # PS VOLUP VOLDOWN, L3 R3 (PS TV and controllers only)
    ./linux/vitactl.py hold L R 2000
    ./linux/vitactl.py stick L 128 0 1000
    ./linux/vitactl.py touch 480 272   # screenshot pixels (960x544)
+   ./linux/vitactl.py touch2 300 272 660 272         # two fingers
+   ./linux/vitactl.py swipe 480 450 480 100          # one finger moving (300 ms)
+   ./linux/vitactl.py pinch 480 272 100 400          # two fingers spreading: zoom in
+   ./linux/vitactl.py touch --rear --force 64 480 272   # rear touchpad, behind that pixel
    ./linux/vitactl.py shot menu.png   # the next frame, taken after the last input
    ./linux/vitactl.py run steps.txt   # one command per line, plus "wait ms"
    ./linux/vitactl.py status          # devices, video, and what the plugin reports
@@ -81,6 +86,11 @@ app from the command line: it saves the Vita's screen and sends input.
 
 Opening VitaShell's USB transfer takes USB away from the plugin; it takes USB
 back by itself a few seconds after the transfer is closed.
+
+> **Known issue:** once `vitactl.py` has sent input or run `status` in a boot,
+> opening VitaShell's USB transfer can freeze the Vita (it crashes 30–60 s
+> later). Video alone is fine. In such a boot, copy files over VitaShell's FTP,
+> or reboot before opening USB transfer. Details and leads in [TODO.md](TODO.md).
 
 ## Misc
 

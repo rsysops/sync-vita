@@ -31,6 +31,34 @@
 #define DCALL(expr)	({ int r__ = (int)(expr); \
 			   DLOG(#expr " = 0x%08X\n", r__); r__; })
 
+/* Heartbeat (report ID 1 to the PC every ~500 ms), read by vitactl.py
+ * status. Build 93 turned it off to test whether it caused the USB transfer
+ * freeze (see TODO.md): it froze anyway, so it is on again. */
+#ifndef ENABLE_HEARTBEAT
+#define ENABLE_HEARTBEAT 1
+#endif
+
+/* Breadcrumbs (DEBUG): USB callbacks and uvc_thread record where they are;
+ * a logger thread writes every change to the log. Added to find where
+ * VitaShell's USB transfer freezes the Vita after the PC used the HID
+ * interface. No file IO here: callbacks only store numbers. */
+#ifdef DEBUG
+static volatile unsigned int bc_attach_step, bc_detach_step;
+static volatile unsigned int bc_abort_n, bc_abort_step, bc_uvc_where;
+static volatile unsigned int bc_ep3_done_n;
+static volatile int bc_ep3_last_rc;
+struct bc_ep0_req {
+	unsigned char type, req;
+	unsigned short value, index, length;
+};
+#define BC_EP0_RING 32
+static struct bc_ep0_req bc_ep0_ring[BC_EP0_RING];
+static volatile unsigned int bc_ep0_head;
+#define BC(var, v)	((var) = (v))
+#else
+#define BC(var, v)	((void)0)
+#endif
+
 #define ALIGN(x, a)			(((x) + ((a) - 1)) & ~((a) - 1))
 #define UNUSED(x)			((void)x)
 
@@ -138,25 +166,58 @@ static unsigned char pc_hid_report[PC_HID_REPORT_SIZE] __attribute__((aligned(64
 static SceUdcdDeviceRequest pc_hid_recv_req;
 static volatile int pc_control_active;
 static volatile unsigned int pc_buttons;
-/* PS (home) button, report byte 11 bit 0. It is a kernel button: it can
- * only be emulated through the kernelButtons mask. */
-static volatile int pc_ps;
+/* Kernel buttons from report byte 11 (bit 0 PS, bit 1 VOL+, bit 2 VOL-),
+ * as SceCtrl bits. They can only be emulated through the kernelButtons
+ * mask, never the user one. */
+static volatile unsigned int pc_kbuttons;
 static volatile unsigned char pc_lx = 128, pc_ly = 128, pc_rx = 128, pc_ry = 128;
 static volatile unsigned int pc_hid_recv_ok;
 static volatile unsigned int pc_hid_recv_err;
 static volatile int pc_ret_button_emu;
 static volatile int pc_ret_analog_emu;
 
-/* ---- Touch injection (PC mouse click -> Vita front touchscreen) ---- */
+/* ---- Touch injection (PC -> Vita front screen and rear touchpad) ----
+ * Up to two fingers per panel. Coordinates are raw panel units: the
+ * front is 1920x1088; the rear's active area is read from the Vita
+ * (rear_panel_info) and the PC maps onto it. */
 #define TOUCHSCREEN_WIDTH  1920
 #define TOUCHSCREEN_HEIGHT 1088
+#define PC_TOUCH_PORTS     2	/* SCE_TOUCH_PORT_FRONT, SCE_TOUCH_PORT_BACK */
+#define PC_TOUCH_FINGERS   2
+#define PC_TOUCH_FORCE_DEFAULT 128
 
-static volatile int pc_touch_active;
-static volatile unsigned int pc_touch_x;
-static volatile unsigned int pc_touch_y;
-static volatile unsigned char pc_touch_id;
+struct pc_finger {
+	volatile unsigned char down;
+	volatile unsigned char id;
+	volatile unsigned short x, y;
+};
+static struct pc_finger pc_fingers[PC_TOUCH_PORTS][PC_TOUCH_FINGERS];
+static volatile unsigned char pc_touch_force[PC_TOUCH_PORTS];
+static unsigned char pc_touch_next_id;
 static volatile unsigned char h_peek, h_peekR, h_read, h_readR, h_peek2, h_read2;
 static volatile unsigned int touch_patch_hits;
+/* Reads patched per panel since the last heartbeat: shows whether the
+ * running app reads that panel at all. */
+static volatile unsigned char touch_patched_reads[PC_TOUCH_PORTS];
+
+static int pc_touch_any(int port)
+{
+	int f;
+
+	for (f = 0; f < PC_TOUCH_FINGERS; f++)
+		if (pc_fingers[port][f].down)
+			return 1;
+	return 0;
+}
+
+static void pc_touch_release_all(void)
+{
+	int p, f;
+
+	for (p = 0; p < PC_TOUCH_PORTS; p++)
+		for (f = 0; f < PC_TOUCH_FINGERS; f++)
+			pc_fingers[p][f].down = 0;
+}
 
 /* ---- Exit game (remplace le bouton PS : �chap maintenu sur le PC) ----
  * Le PID du jeu est captur� dans patch_touch_data (seul endroit o� l'on
@@ -513,21 +574,17 @@ static volatile unsigned short real_touch_y;
 static volatile unsigned char real_touch_seen;
 static volatile unsigned char real_touch_down;
 
-/* Real active-area bounds reported by the panel driver; injected
- * coordinates are remapped into this range so clicks land where the
- * system expects them. */
-static SceTouchPanelInfo touch_panel_info;
-static int touch_panel_inited;
+/* Rear touchpad active area as reported by the panel driver, sent in the
+ * heartbeat so the PC can map positions onto it. Read once from
+ * uvc_thread (thread context), not from a hook. */
+static SceTouchPanelInfo rear_panel_info;
 extern int ksceTouchGetPanelInfo(unsigned int port, SceTouchPanelInfo *info);
 
-static void touch_ensure_panel_info(void)
+static void rear_panel_info_read(void)
 {
-	if (touch_panel_inited)
-		return;
-	memset(&touch_panel_info, 0, sizeof(touch_panel_info));
-	if (ksceTouchGetPanelInfo(SCE_TOUCH_PORT_FRONT, &touch_panel_info) == 0 &&
-	    touch_panel_info.maxAaX > 0)
-		touch_panel_inited = 1;
+	memset(&rear_panel_info, 0, sizeof(rear_panel_info));
+	if (ksceTouchGetPanelInfo(SCE_TOUCH_PORT_BACK, &rear_panel_info) < 0)
+		memset(&rear_panel_info, 0, sizeof(rear_panel_info));
 }
 
 /* Hooking the SceTouch driver's read paths globally (same technique as
@@ -572,14 +629,18 @@ static void patch_touch_data(int port, SceTouchData *data, int count)
 	if (pc_control_active)
 		game_pid = ksceKernelGetProcessId();
 
-	if (port != SCE_TOUCH_PORT_FRONT || !data || count <= 0)
+	if ((port != SCE_TOUCH_PORT_FRONT && port != SCE_TOUCH_PORT_BACK) ||
+	    !data || count <= 0)
 		return;
 
 	/* Ground truth capture + passthrough when idle: while the PC is not
 	 * pressing, the REAL digitizer data must flow untouched � writing
 	 * empty history here would erase physical finger input. */
-	if (!pc_touch_active) {
+	if (!pc_touch_any(port)) {
 		int any = 0;
+		/* The ground-truth capture below is for the front only. */
+		if (port != SCE_TOUCH_PORT_FRONT)
+			return;
 		for (i = 0; i < count; i++) {
 			if (data[i].reportNum > 0) {
 				real_touch_x = data[i].report[0].x;
@@ -597,26 +658,39 @@ static void patch_touch_data(int port, SceTouchData *data, int count)
 	}
 
 	touch_patch_hits++;
-	touch_edge_history = (unsigned char)((touch_edge_history << 1) | 1);
-	last_read_count = (unsigned char)count;
+	if (touch_patched_reads[port] < 255)
+		touch_patched_reads[port]++;
+	if (port == SCE_TOUCH_PORT_FRONT) {
+		touch_edge_history = (unsigned char)((touch_edge_history << 1) | 1);
+		last_read_count = (unsigned char)count;
+	}
 
-	/* PROVEN configuration: steady pressed finger at the cursor,
-	 * preserving each buffer's timestamp/status. */
+	/* PROVEN configuration: steady pressed fingers at the given points,
+	 * preserving each buffer's timestamp/status. One report per finger
+	 * held, each with the id it got when it touched down (a new contact
+	 * gets a new id, like a real digitizer: some games ignore repeated
+	 * contacts reusing an old id). */
 	for (i = 0; i < count; i++) {
 		SceUInt64 ts = data[i].timeStamp;
 		SceUInt32 st = data[i].status;
+		int f, n = 0;
 
 		memset(&data[i], 0, sizeof(SceTouchData));
 		data[i].timeStamp = ts;
 		data[i].status = st;
-		data[i].reportNum = 1;
-		/* New contact => new finger id, like a real digitizer:
-		 * some games ignore repeated contacts reusing an old id. */
-		data[i].report[0].id = pc_touch_id ? pc_touch_id : 1;
-		data[i].report[0].force = 128;
-		data[i].report[0].x = (unsigned short)pc_touch_x;
-		data[i].report[0].y = (unsigned short)pc_touch_y;
-		data[i].report[0].info = 0;
+		for (f = 0; f < PC_TOUCH_FINGERS; f++) {
+			const struct pc_finger *pf = &pc_fingers[port][f];
+
+			if (!pf->down)
+				continue;
+			data[i].report[n].id = pf->id ? pf->id : 1;
+			data[i].report[n].force = pc_touch_force[port];
+			data[i].report[n].x = (short)pf->x;
+			data[i].report[n].y = (short)pf->y;
+			data[i].report[n].info = 0;
+			n++;
+		}
+		data[i].reportNum = n;
 	}
 }
 
@@ -1091,8 +1165,9 @@ static void pc_control_apply(void)
      * (0x400/0x800) as a fallback. */
     {
         unsigned int b = pc_buttons | ((pc_buttons & 0x0300u) << 2);
-        /* PS only in the kernel mask: user masks can't carry it. */
-        unsigned int kb = b | (pc_ps ? SCE_CTRL_PSBUTTON : 0);
+        /* PS and volume only in the kernel mask: user masks can't carry
+         * them. */
+        unsigned int kb = b | pc_kbuttons;
         ret_b = 0;
         for (slot = 1; slot <= 3; slot++) {
             ret_b |= ksceCtrlSetButtonEmulation(0, (unsigned char)slot,
@@ -1109,7 +1184,8 @@ static void pc_control_release(void)
 
 	pc_control_active = 0;
 	pc_buttons = 0;
-	pc_ps = 0;
+	pc_kbuttons = 0;
+	pc_touch_release_all();
 	pc_lx = pc_ly = pc_rx = pc_ry = 128;
 	/* Session termin�e : on r�autorise un kill et on oublie l'ancien
 	 * PID (le jeu au premier plan peut avoir chang� entre-temps).
@@ -1128,8 +1204,33 @@ static void pc_control_release(void)
 	                           0, 0, 0, 0, 4);
 }
 
-/* Shared helper: apply a freshly received 16-byte PC report, whichever
- * transport (interrupt endpoint or EP0 SET_REPORT) it arrived through. */
+/* One finger from the report: 3 bytes, 12-bit X then 12-bit Y (byte 0 =
+ * X low, byte 1 = Y low, byte 2 = X high nibble | Y high nibble << 4). */
+static void pc_apply_finger(int port, int f, int down, const unsigned char *p)
+{
+	struct pc_finger *pf = &pc_fingers[port][f];
+	unsigned int tx = (unsigned int)p[0] | (((unsigned int)p[2] & 0x0F) << 8);
+	unsigned int ty = (unsigned int)p[1] | ((((unsigned int)p[2] >> 4) & 0x0F) << 8);
+
+	if (tx >= TOUCHSCREEN_WIDTH)  tx = TOUCHSCREEN_WIDTH - 1;
+	if (ty >= TOUCHSCREEN_HEIGHT) ty = TOUCHSCREEN_HEIGHT - 1;
+	pf->x = (unsigned short)tx;
+	pf->y = (unsigned short)ty;
+	if (down && !pf->down) {
+		/* New contact -> new finger id, never 0. */
+		if (++pc_touch_next_id == 0)
+			pc_touch_next_id = 1;
+		pf->id = pc_touch_next_id;
+	}
+	pf->down = down ? 1 : 0;
+}
+
+/* Shared helper: apply a freshly received 64-byte PC report, whichever
+ * transport (interrupt endpoint or EP0 SET_REPORT) it arrived through.
+ * Layout: 1-2 buttons, 3-6 sticks, 7 touch flags (bit 0/1 front fingers,
+ * bit 2/3 rear fingers), 8-10 front finger 1, 11 kernel buttons (bit 0 PS,
+ * bit 1 VOL+, bit 2 VOL-), 12-14 front finger 2, 15-17 rear finger 1,
+ * 18 exit game, 19-21 rear finger 2, 22/23 front/rear force (0 = 128). */
 static void pc_hid_apply_report(const unsigned char *report)
 {
 	if (report[0] != PC_HID_REPORT_ID_OUTPUT)
@@ -1137,34 +1238,25 @@ static void pc_hid_apply_report(const unsigned char *report)
 
 	pc_buttons = (unsigned int)report[1] |
 	             ((unsigned int)report[2] << 8);
-	pc_ps = report[11] & 0x01;
+	pc_kbuttons = ((report[11] & 0x01) ? SCE_CTRL_PSBUTTON : 0) |
+	              ((report[11] & 0x02) ? SCE_CTRL_VOLUP : 0) |
+	              ((report[11] & 0x04) ? SCE_CTRL_VOLDOWN : 0);
 	pc_lx = report[3];
 	pc_ly = report[4];
 	pc_rx = report[5];
 	pc_ry = report[6];
 
-	/* Touch packet: flags byte then 12-bit X / 12-bit Y coordinates.
-	 * High nibbles live in report[10] (low nibble = X high, high
-	 * nibble = Y high), exactly where the PC app writes them. */
 	{
 		unsigned char fl = report[7];
-		unsigned int tx = (unsigned int)report[8] |
-		                  (((unsigned int)report[10] & 0x0F) << 8);
-		unsigned int ty = (unsigned int)report[9] |
-		                  ((((unsigned int)report[10] >> 4) & 0x0F) << 8);
 
-		if (tx >= TOUCHSCREEN_WIDTH)  tx = TOUCHSCREEN_WIDTH - 1;
-		if (ty >= TOUCHSCREEN_HEIGHT) ty = TOUCHSCREEN_HEIGHT - 1;
-		pc_touch_x = tx;
-		pc_touch_y = ty;
-		if (fl & 0x01) {
-			if (!pc_touch_active) {
-				pc_touch_id++; /* new contact -> new finger id */
-			}
-			pc_touch_active = 1;
-		} else {
-			pc_touch_active = 0;
-		}
+		pc_touch_force[SCE_TOUCH_PORT_FRONT] =
+			report[22] ? report[22] : PC_TOUCH_FORCE_DEFAULT;
+		pc_touch_force[SCE_TOUCH_PORT_BACK] =
+			report[23] ? report[23] : PC_TOUCH_FORCE_DEFAULT;
+		pc_apply_finger(SCE_TOUCH_PORT_FRONT, 0, fl & 0x01, &report[8]);
+		pc_apply_finger(SCE_TOUCH_PORT_FRONT, 1, fl & 0x02, &report[12]);
+		pc_apply_finger(SCE_TOUCH_PORT_BACK, 0, fl & 0x04, &report[15]);
+		pc_apply_finger(SCE_TOUCH_PORT_BACK, 1, fl & 0x08, &report[19]);
 	}
 
 	/* Commande "quitter le jeu" : le PC ne l'envoie que pendant la
@@ -1183,6 +1275,8 @@ static void pc_hid_apply_report(const unsigned char *report)
 
 static void pc_hid_recv_on_complete(SceUdcdDeviceRequest *req)
 {
+	BC(bc_ep3_done_n, bc_ep3_done_n + 1);
+	BC(bc_ep3_last_rc, req->returnCode);
 	if (req->returnCode < 0) {
 		if (pc_hid_recv_err < 255)
 			pc_hid_recv_err++;
@@ -1358,23 +1452,30 @@ static void pc_hid_send_input_heartbeat(void)
 	                         (touch_read_region_hook_uid > 0 ? 8 : 0) |
 	                         (touch_peek2_hook_uid > 0 ? 16 : 0) |
 	                         (touch_read2_hook_uid > 0 ? 32 : 0));
-	hb[29] = (pc_touch_active ? 1 : 0) | (pc_ps ? 2 : 0);
-	hb[30] = (unsigned char)(pc_touch_x & 0xFF);
-	hb[31] = (unsigned char)(pc_touch_y & 0xFF);
+	/* bit 0 front finger, 1 PS, 2 VOL+, 3 VOL-, 4 rear finger */
+	hb[29] = (pc_touch_any(SCE_TOUCH_PORT_FRONT) ? 0x01 : 0) |
+	         ((pc_kbuttons & SCE_CTRL_PSBUTTON) ? 0x02 : 0) |
+	         ((pc_kbuttons & SCE_CTRL_VOLUP) ? 0x04 : 0) |
+	         ((pc_kbuttons & SCE_CTRL_VOLDOWN) ? 0x08 : 0) |
+	         (pc_touch_any(SCE_TOUCH_PORT_BACK) ? 0x10 : 0);
+	/* Reads patched per panel since the last heartbeat. */
+	hb[30] = touch_patched_reads[SCE_TOUCH_PORT_FRONT];
+	hb[31] = touch_patched_reads[SCE_TOUCH_PORT_BACK];
 	hb[32] = h_peek;
 	hb[33] = h_peekR;
 	hb[34] = h_read;
 	hb[35] = h_readR;
 	hb[36] = h_peek2;
 	hb[37] = h_read2;
-	hb[38] = (unsigned char)(touch_panel_info.minAaX & 0xFF);
-	hb[39] = (unsigned char)(((unsigned short)touch_panel_info.minAaX >> 8) & 0xFF);
-	hb[40] = (unsigned char)((unsigned short)touch_panel_info.maxAaX & 0xFF);
-	hb[41] = (unsigned char)(((unsigned short)touch_panel_info.maxAaX >> 8) & 0xFF);
-	hb[42] = (unsigned char)(touch_panel_info.minAaY & 0xFF);
-	hb[43] = (unsigned char)(((unsigned short)touch_panel_info.minAaY >> 8) & 0xFF);
-	hb[44] = (unsigned char)((unsigned short)touch_panel_info.maxAaY & 0xFF);
-	hb[45] = (unsigned char)(((unsigned short)touch_panel_info.maxAaY >> 8) & 0xFF);
+	/* Rear touchpad active area (little-endian): min X, max X, min Y, max Y. */
+	hb[38] = (unsigned char)(rear_panel_info.minAaX & 0xFF);
+	hb[39] = (unsigned char)(((unsigned short)rear_panel_info.minAaX >> 8) & 0xFF);
+	hb[40] = (unsigned char)((unsigned short)rear_panel_info.maxAaX & 0xFF);
+	hb[41] = (unsigned char)(((unsigned short)rear_panel_info.maxAaX >> 8) & 0xFF);
+	hb[42] = (unsigned char)(rear_panel_info.minAaY & 0xFF);
+	hb[43] = (unsigned char)(((unsigned short)rear_panel_info.minAaY >> 8) & 0xFF);
+	hb[44] = (unsigned char)((unsigned short)rear_panel_info.maxAaY & 0xFF);
+	hb[45] = (unsigned char)(((unsigned short)rear_panel_info.maxAaY >> 8) & 0xFF);
 	hb[46] = (unsigned char)((svc_peek_hook_uid > 0 ? 1 : 0) |
 	                         (svc_peek_region_hook_uid > 0 ? 2 : 0) |
 	                         (svc_read_hook_uid > 0 ? 4 : 0) |
@@ -1432,7 +1533,7 @@ static void pc_hid_send_input_heartbeat(void)
 	/* NULLs (appels bloquants) dans le quartet haut de hb[46] */
 	hb[46] = (unsigned char)((hb[46] & 0x0F) |
 		 ((n_null_calls > 15 ? 15 : n_null_calls) << 4));
-	hb[63] = 90; /* build id: 90 = PS button (report byte 11) */
+	hb[63] = 95; /* build id: 90 PS, 91 all inputs, 95 = 91 + debug breadcrumbs (TODO.md) */
 
 	ep2_try_send(hb);
 	usb_audio_ok_cnt = 0;
@@ -1441,6 +1542,8 @@ static void pc_hid_send_input_heartbeat(void)
 	n_null_calls = 0;
 	n_pub_chunks = 0;
 	n_enc_frames = 0;
+	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;
+	touch_patched_reads[SCE_TOUCH_PORT_BACK] = 0;
 }
 
 /* ---- Worker audio d�di� ----
@@ -1570,8 +1673,10 @@ static int uvc_frame_req_submit_phycont(const void *data, unsigned int size)
 	if (ret < 0)
 		return ret;
 
+	BC(bc_uvc_where, 5);
 	ret = ksceKernelWaitEventFlagCB(uvc_frame_req_evflag, 1, SCE_EVENT_WAITOR |
 					SCE_EVENT_WAITCLEAR_PAT, NULL, NULL);
+	BC(bc_uvc_where, 6);
 
 	return ret;
 }
@@ -1682,18 +1787,25 @@ static void uvc_handle_video_streaming_req(const SceUdcdEP0DeviceRequest *req)
 
 static void uvc_handle_video_abort(void)
 {
+	BC(bc_abort_n, bc_abort_n + 1);
+	BC(bc_abort_step, 1);
 	if (stream) {
 		stream = 0;
 
 		ksceUdcdClearFIFO(&endpoints[1]);
 	ksceUdcdClearFIFO(&endpoints[2]);
 	ksceUdcdClearFIFO(&endpoints[3]);
+		BC(bc_abort_step, 2);
 	pc_control_release();
+		BC(bc_abort_step, 3);
 	pc_hid_start_receive();
+		BC(bc_abort_step, 4);
 		ksceUdcdReqCancelAll(&endpoints[1]);
+		BC(bc_abort_step, 5);
 		exit_phase = 0;
 		kill_hold = 0;
 	}
+	BC(bc_abort_step, 9);
 }
 
 static void uvc_handle_set_interface(const SceUdcdEP0DeviceRequest *req)
@@ -1718,6 +1830,20 @@ static int uvc_udcd_process_request(int recipient, int arg, SceUdcdEP0DeviceRequ
 {
 	if (arg < 0)
 		return -1;
+
+#ifdef DEBUG
+	{
+		unsigned int h = bc_ep0_head;
+		struct bc_ep0_req *e = &bc_ep0_ring[h % BC_EP0_RING];
+
+		e->type = req->bmRequestType;
+		e->req = req->bRequest;
+		e->value = req->wValue;
+		e->index = req->wIndex;
+		e->length = req->wLength;
+		bc_ep0_head = h + 1;
+	}
+#endif
 
 	switch (req->bmRequestType) {
 	case USB_CTRLTYPE_DIR_DEVICE2HOST |
@@ -1843,13 +1969,18 @@ static int uvc_udcd_attach(int usb_version, void *user_data)
 #endif
 	/* Measure the sticks' rest position BEFORE enabling anything, while
 	 * the values read are still the untouched hardware ones. */
+	BC(bc_attach_step, 1);
 	pc_ctrl_capture_neutral();
+	BC(bc_attach_step, 2);
 
 	ksceUdcdClearFIFO(&endpoints[1]);
 	ksceUdcdClearFIFO(&endpoints[2]);
 	ksceUdcdClearFIFO(&endpoints[3]);
+	BC(bc_attach_step, 3);
 	pc_control_release();
+	BC(bc_attach_step, 4);
 	pc_hid_start_receive();
+	BC(bc_attach_step, 9);
 
 #if defined(DISPLAY_OFF_OLED)
 	prev_brightness = ksceOledGetBrightness();
@@ -1867,9 +1998,13 @@ static void uvc_udcd_detach(void *user_data)
 #ifdef DEBUG
 	dbg_detach_n++;
 #endif
+	BC(bc_detach_step, 1);
 	uvc_handle_video_abort();
+	BC(bc_detach_step, 2);
 	ksceUdcdReqCancelAll(&endpoints[3]);
+	BC(bc_detach_step, 3);
 	pc_control_release();
+	BC(bc_detach_step, 9);
 
 #if defined(DISPLAY_OFF_OLED)
 	ksceOledDisplayOn();
@@ -2197,15 +2332,6 @@ static void usb_record_states(void)
 	     usb_ours_running_state, usb_mtp_stopped_state, usb_driver_running);
 }
 
-#ifdef DEBUG
-/* Our driver is still the one on the port: the callback says running and
- * its state is unchanged. */
-static int usb_ours_running(void)
-{
-	return usb_driver_running &&
-	       ksceUdcdGetDrvState(UVC_DRIVER_NAME) == usb_ours_running_state;
-}
-#endif
 
 /* Our driver was stopped: both signals must agree. If either one doesn't
  * behave as expected, no retake happens, which is safe. */
@@ -2223,21 +2349,9 @@ static int usb_mtp_restarted(void)
 	return st >= 0 && st != usb_mtp_stopped_state;
 }
 
-#ifdef DEBUG
-/* While VitaShell's USB transfer is open, the PC has ux0: mounted as a raw
- * disk, and writing the log to it from here could corrupt the card.
- * VitaShell stops both our driver and MTP while the transfer is open, so
- * only write while our driver still runs or MTP is back; until then lines
- * stay buffered. */
-static void dbg_flush_if_safe(void)
-{
-	if (usb_states_known && (usb_ours_running() || usb_mtp_restarted()))
-		log_flush();
-}
-#define DFLUSH_SAFE()	dbg_flush_if_safe()
-#else
-#define DFLUSH_SAFE()	((void)0)
-#endif
+/* The debug log is on ur0:, which VitaShell's USB transfer never hands to
+ * the PC, so it can be written at any time. */
+#define DFLUSH_SAFE()	DFLUSH()
 
 /* After VitaShell's USB transfer closes, the port is back in MTP mode
  * (VitaShell restarts only MTP). Clear what the eviction left behind, then
@@ -2282,6 +2396,11 @@ static int uvc_thread(SceSize args, void *argp)
 	 * the reference states could be read. */
 	if (DCALL(uvc_start()) == 0)
 		usb_record_states();
+	rear_panel_info_read();
+	DLOG("rear panel: X %d-%d, Y %d-%d, force %u-%u\n",
+	     rear_panel_info.minAaX, rear_panel_info.maxAaX,
+	     rear_panel_info.minAaY, rear_panel_info.maxAaY,
+	     rear_panel_info.minForce, rear_panel_info.maxForce);
 	int usb_free_checks = 0, usb_retake_fails = 0;
 	SceUInt64 next_usb_check = 0;
 	/* First write to ux0:. By now (15 s+ after start) henlo has mounted
@@ -2310,6 +2429,7 @@ static int uvc_thread(SceSize args, void *argp)
 	while (uvc_thread_run) {
 		unsigned int out_bits;
 
+		BC(bc_uvc_where, 1);
 		int ret = ksceKernelWaitEventFlagCB(uvc_event_flag_id, 1,
 			SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
 			&out_bits, (SceUInt32[]){8000});
@@ -2355,7 +2475,9 @@ static int uvc_thread(SceSize args, void *argp)
 
 		if (now - last_hb >= 500000) { /* heartbeat every ~500 ms */
 			last_hb = now;
+#if ENABLE_HEARTBEAT
 			pc_hid_send_input_heartbeat();
+#endif
 		}
 
 		/* Take the port back once VitaShell's USB transfer has closed.
@@ -2386,8 +2508,10 @@ static int uvc_thread(SceSize args, void *argp)
 			if (usb_ours_evicted() && usb_mtp_restarted()) {
 				if (++usb_free_checks >= USB_FREE_CHECKS) {
 					usb_free_checks = 0;
+					BC(bc_uvc_where, 7);
 					if (usb_retake() < 0)
 						usb_retake_fails++;
+					BC(bc_uvc_where, 8);
 				}
 			} else {
 				usb_free_checks = 0;
@@ -2413,7 +2537,7 @@ static int uvc_thread(SceSize args, void *argp)
 #endif
 		} else if (pc_control_active && now - last_rx_change > 1000000ULL) {
 			pc_control_release();
-			pc_touch_active = 0;
+			pc_touch_release_all();
 			touch_hooks_wanted = 0;
 #if ENABLE_AUDIO_CAPTURE
 			audio_capture_on = 0;
@@ -2473,7 +2597,7 @@ static int uvc_thread(SceSize args, void *argp)
 					 * game_pid. */
 					exit_target_pid = game_pid;
 					pc_control_release();
-					pc_touch_active = 0;
+					pc_touch_release_all();
 					kill_hold = 60; /* ~0,5 s de drain */
 					exit_phase = 1;
 					exit_block = 0;
@@ -2504,7 +2628,9 @@ static int uvc_thread(SceSize args, void *argp)
 			kill_hold--;
 
 		if (ret == 0 && stream && kill_hold == 0) {
+			BC(bc_uvc_where, 3);
 			int sf = send_frame();
+			BC(bc_uvc_where, 4);
 #ifdef DEBUG
 			/* Log each new error code once, not every frame. */
 			if (sf < 0 && sf != dbg_last_frame_err) {
@@ -2756,6 +2882,58 @@ static int SceUdcd_sub_01E1128C_hook_func(const SceUdcdConfigDescriptor *config_
 	return ret;
 }
 
+#ifdef DEBUG
+/* Writes breadcrumb changes and every EP0 request to the log 5 times a
+ * second, plus a line every 5 s showing where uvc_thread is. Runs on its
+ * own, so it keeps logging if uvc_thread or a USB callback hangs. */
+static SceUID dbg_logger_id = -1;
+static volatile int dbg_logger_run;
+
+static int dbg_logger_thread(SceSize args, void *argp)
+{
+	unsigned int seen[9], ep0_seen = 0, ticks = 0;
+
+	(void)args; (void)argp;
+	memset(seen, 0, sizeof(seen));
+	while (dbg_logger_run) {
+		unsigned int now[9];
+		unsigned int head = bc_ep0_head;
+		int changed;
+
+		now[0] = dbg_attach_n;   now[1] = bc_attach_step;
+		now[2] = dbg_detach_n;   now[3] = bc_detach_step;
+		now[4] = bc_abort_n;     now[5] = bc_abort_step;
+		now[6] = dbg_drv_start_n; now[7] = dbg_drv_stop_n;
+		now[8] = bc_ep3_done_n;
+		changed = memcmp(now, seen, sizeof(now)) != 0;
+
+		if (head - ep0_seen > BC_EP0_RING) {
+			DLOG("bc: %u EP0 requests not logged\n",
+			     head - ep0_seen - BC_EP0_RING);
+			ep0_seen = head - BC_EP0_RING;
+		}
+		while (ep0_seen != head) {
+			const struct bc_ep0_req *e = &bc_ep0_ring[ep0_seen % BC_EP0_RING];
+
+			DLOG("bc: ep0 type %02X req %02X value %04X index %04X len %u\n",
+			     e->type, e->req, e->value, e->index, e->length);
+			ep0_seen++;
+		}
+		if (changed || ++ticks >= 25) {
+			DLOG("bc: attach %u step %u, detach %u step %u, abort %u step %u, "
+			     "drv start %u stop %u, ep3 done %u rc 0x%08X, uvc_thread at %u\n",
+			     now[0], now[1], now[2], now[3], now[4], now[5],
+			     now[6], now[7], now[8], bc_ep3_last_rc, bc_uvc_where);
+			memcpy(seen, now, sizeof(now));
+			ticks = 0;
+		}
+		log_flush();
+		ksceKernelDelayThread(200000);
+	}
+	return 0;
+}
+#endif
+
 void _start() __attribute__((weak, alias("module_start")));
 
 int module_start(SceSize argc, const void *args)
@@ -2767,6 +2945,13 @@ int module_start(SceSize argc, const void *args)
 	log_reset();
 #endif
 	DLOG("VitaSync debug build " __DATE__ " " __TIME__ "\n");
+#ifdef DEBUG
+	dbg_logger_run = 1;
+	dbg_logger_id = DCALL(ksceKernelCreateThread("vitasync_log", dbg_logger_thread,
+						     0x40, 0x4000, 0, 0x10000, 0));
+	if (dbg_logger_id >= 0)
+		ksceKernelStartThread(dbg_logger_id, 0, NULL);
+#endif
 
 	SceUdcd_modinfo.size = sizeof(SceUdcd_modinfo);
 	DCALL(taiGetModuleInfoForKernel(KERNEL_PID, "SceUdcd", &SceUdcd_modinfo));
@@ -2874,6 +3059,14 @@ err_return:
 
 int module_stop(SceSize argc, const void *args)
 {
+#ifdef DEBUG
+	if (dbg_logger_id >= 0) {
+		dbg_logger_run = 0;
+		ksceKernelWaitThreadEnd(dbg_logger_id, NULL, NULL);
+		ksceKernelDeleteThread(dbg_logger_id);
+		dbg_logger_id = -1;
+	}
+#endif
 	pc_control_release();
 	ksceUdcdReqCancelAll(&endpoints[3]);
 	uvc_thread_run = 0;

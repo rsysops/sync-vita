@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#define LOG_PATH "ux0:dump/"
+/* ur0: (internal storage) because VitaShell's USB transfer never hands it
+ * to the PC: the log can be written at any time, even during a transfer. */
+#define LOG_PATH "ur0:data/"
 #define LOG_FILE LOG_PATH "VitaSync_log.txt"
 
 void log_reset();

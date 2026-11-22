@@ -16,10 +16,19 @@ void audio_fini(void);
  * interface, or the cable went away (on = 0). Safe in USB callbacks. */
 void audio_set_streaming(int on);
 
-/* Heartbeat fields: state bits (1 = PC wants sound, 2 = streaming,
- * 4 = ready), packets sent since the last call (divided by 4, max 255),
- * errors since start (max 255). */
+/* Heartbeat fields, counted since the last call (~500 ms):
+ * state: 1 PC wants sound, 2 streaming, 4 ready, 8 capturing the Vita's
+ *        mix, 16 route taken back after a reset, 32 monitor functions not
+ *        found (silence sent), 64 capture failed (silence sent),
+ * packets_div4: packets sent / 4 (max 255);
+ *        128 a stream had to start with an old request queued (stays
+ *        until reboot);
+ * packets_div4 counts 1 ms packets; requests carry 8 of them;
+ * errors: failed requests (max 255, counted only while streaming);
+ * xruns: the ring ran dry, skipped ahead or overflowed (max 15);
+ * last_error_low: low byte of the last failure code (0x8024xxxx). */
 void audio_heartbeat(unsigned char *state, unsigned char *packets_div4,
-		     unsigned char *errors);
+		     unsigned char *errors, unsigned char *xruns,
+		     unsigned char *last_error_low);
 
 #endif

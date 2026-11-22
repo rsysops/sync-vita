@@ -865,12 +865,33 @@ def cmd_status():
         b = [int.from_bytes(hb[i:i + 2], "little", signed=True) for i in (38, 40, 42, 44)]
         print(f"touch reads patched in the last 0.5 s: front {hb[30]}, rear {hb[31]}; "
               f"rear touchpad X {b[0]}-{b[1]}, Y {b[2]}-{b[3]}")
-    # hb[9] is reused by the plugin for a debug probe, so only bits 8+ of
-    # what the console sees are reliable: L and R (0x100, 0x200), L1/R1 copies,
-    # and the face buttons.
+    # Before build 96, hb[9] held a debug probe, so SELECT, START and the
+    # D-pad (bits 0-7) weren't reported.
     console = (hb[10] << 8) | (hb[11] << 16) | (hb[12] << 24)
-    print(f"console sees: {button_names(console & 0xFF00)} (SELECT, START and D-pad not reported); "
+    if build >= 96:
+        console |= hb[9]
+    note = "" if build >= 96 else " (SELECT, START and D-pad not reported)"
+    print(f"console sees: {button_names(console & 0xFFFF)}{note}; "
           f"sticks L {hb[13]},{hb[14]} R {hb[15]},{hb[16]}")
+    if build >= 97:
+        st = hb[19]
+        words = [w for bit, w in ((0x01, "PC listening"), (0x02, "streaming"),
+                                  (0x08, "capturing the Vita's sound"),
+                                  (0x10, "route taken back once"),
+                                  (0x20, "monitor functions not found, silence"),
+                                  (0x40, "capture failed, silence"),
+                                  (0x80, "a stream had to start with old requests queued")
+                                  if build >= 99 else (0, ""))
+                 if st & bit]
+        if not st & 0x04:
+            words.insert(0, "NOT READY")
+        if build >= 98:
+            errors = f"{hb[62]} failed, last code ends in {hb[18]:02X}" if hb[62] \
+                else "no failures"
+        else:
+            errors = f"{hb[62] >> 4} failed completions, {hb[62] & 0x0F} failed sends"
+        print(f"audio: {', '.join(words) or 'idle'}; last 0.5 s: {hb[60] * 4} packets, "
+              f"{errors}, {hb[59] >> 4} underruns/overflows")
 
 
 # ---- dispatch ----

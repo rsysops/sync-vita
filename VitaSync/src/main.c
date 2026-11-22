@@ -814,8 +814,8 @@ static void pc_hid_send_input_heartbeat(void)
 	hb[15] = pad.rx;
 	hb[16] = pad.ry;
 	hb[17] = (unsigned char)pc_ret_button_emu;
-	hb[18] = (unsigned char)pc_ret_analog_emu;
-	audio_heartbeat(&hb[19], &hb[60], &hb[62]); /* audio state, packets/4, errors */
+	hb[18] = 0; /* audio: last failure code, set below */
+	hb[19] = 0; /* audio state: set below */
 	hb[20] = ++seq;
 
 	/* Video-side ground truth: is the UVC stream active and what did
@@ -879,10 +879,18 @@ static void pc_hid_send_input_heartbeat(void)
 	 * les PIDs tiennent largement dans 16 bits) + kill state. */
 	hb[58] = (unsigned char)((unsigned int)game_pid & 0xFF);
 	hb[59] = (unsigned char)(((unsigned int)game_pid >> 8) & 0x0F);
+	{
+		/* USB audio: state, packets/4, errors, underruns, last failure
+		 * code (audio.h). */
+		unsigned char xruns;
+
+		audio_heartbeat(&hb[19], &hb[60], &hb[62], &xruns, &hb[18]);
+		hb[59] |= (unsigned char)(xruns << 4);
+	}
 	hb[61] = (unsigned char)((exit_game_request ? 8 : 0) |
 	                         ((kill_result & 3) << 4) |
 	                         ((exit_phase & 3) << 6));
-	hb[63] = 96; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio */
+	hb[63] = 101; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight */
 
 	ep2_try_send(hb);
 	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;

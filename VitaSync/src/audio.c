@@ -2,71 +2,214 @@
  * USB audio stream: the Vita's sound to the PC (USB Audio Class 1.0).
  *
  * The PC opens the audio device by selecting alternate setting 1 of the
- * streaming interface; from then on it expects one 192-byte packet (48
- * stereo 16-bit frames) every millisecond on the isochronous IN endpoint.
- * A small queue of one-packet requests is kept in flight: each completion
- * (USB interrupt context) only marks its slot done and wakes the thread,
- * which refills and resubmits it.
+ * streaming interface; from then on it polls the isochronous IN endpoint
+ * every millisecond for one 192-byte packet (48 stereo 16-bit frames).
+ * Two threads run while it does:
  *
- * Step 1 sends silence. Step 2 fills the packets from the Vita's final mix.
+ * - the capture thread switches the Vita's final mix (SrcMix1 main, path 0)
+ *   to "readback" with the kernel's monitor functions and reads it in blocks
+ *   of 512 frames into a ring. Readback takes the mix away from the speaker
+ *   and headphones, so the Vita is silent until the PC closes the device
+ *   and the normal route is restored.
+ * - the USB thread keeps exactly ONE request in flight, carrying 8 packets
+ *   (8 ms), refilled from the ring and resubmitted on each completion.
+ *   Queueing several requests ahead made SceUdcd fail about half of them,
+ *   with code -5, from the second stream after boot on (builds 97-100);
+ *   psvita-usb-audio-midi reports the same and also keeps one in flight.
+ *
+ * Packets are always 48 frames. The drift between the Vita's audio clock
+ * and USB's is absorbed by the ring: it skips ahead when it runs too full
+ * and rebuffers when it runs dry (both counted).
+ *
+ * The monitor functions are documented in vitasdk (psp2kern/audioout.h,
+ * library SceAudioForDriver). They are looked up when a stream starts, not
+ * imported: SceAudio may load after this plugin.
  */
 #include <psp2kern/kernel/threadmgr.h>
 #include <psp2kern/kernel/sysmem.h>
 #include <psp2kern/kernel/cpu.h>
 #include <psp2kern/udcd.h>
+#include <taihen.h>
+#include <stdint.h>
 #include <string.h>
 #include "uac.h"
 #include "audio.h"
 
-#define QUEUE		8	/* one-millisecond requests in flight */
-#define SLOT_STRIDE	256	/* 192 bytes, rounded to cache lines */
+/* ---- USB side ---- */
+#define REQ_PACKETS	8			/* packets per request (8 ms) */
+#define REQ_FRAMES	(REQ_PACKETS * UAC_PACKET_FRAMES)
+#define REQ_BYTES	(REQ_FRAMES * UAC_FRAME_BYTES)	/* 1536, cache aligned */
+
+/* ---- capture side ---- */
+#define CAPTURE_FRAMES	512	/* per monitor read (~10.7 ms) */
+#define SETTLE_BLOCKS	2	/* blocks dropped after the route changes */
+#define MAX_RECOVERIES	4	/* route resets survived per stream */
+#define RING_FRAMES	8192	/* ~170 ms */
+#define RING_MASK	(RING_FRAMES - 1)
+#define RING_TARGET	1536	/* ~32 ms kept queued */
+#define RING_HIGH	(RING_TARGET + 2048)	/* above this, skip back to target */
+
+#define MONITOR_PATH		0	/* SrcMix1 main output */
+#define MONITOR_MODE_NORMAL	0
+#define MONITOR_MODE_READBACK	2
+#define MONITOR_STEREO		2
+#define MONITOR_NOT_READBACK	(-2)	/* Read: the route was reset */
+
+#define SCE_AUDIO_FOR_DRIVER	0x15D711C1
+#define NID_SET_PATH_MODE	0xAC9383D0
+#define NID_SET_SAMPLE_RATE	0x134C96C1
+#define NID_SET_CHANNEL_MODE	0xFC375BAC
+#define NID_MONITOR_READ	0x81EB0AE5
 
 #define EV_WAKE		0x01
 #define EV_DONE		0x02
 #define EV_EXIT		0x04
 
-#define STOP_WAIT_MS	200
+#define STOP_WAIT_MS	500	/* module_stop: wait for a cancelled request */
+#define START_WAIT_MS	1000	/* stream start: wait for a cancelled request */
+
+/* State bits (heartbeat). */
+#define ST_WANTED	0x01
+#define ST_STREAMING	0x02
+#define ST_READY	0x04
+#define ST_CAPTURING	0x08
+#define ST_RECOVERED	0x10
+#define ST_NO_MONITOR	0x20
+#define ST_FAILED	0x40
+#define ST_STALE	0x80	/* a stream had to start with an old request queued */
+
+typedef short frame_t[UAC_CHANNELS];
+
+/* One physically contiguous block: DMA targets for capture and USB. */
+struct audio_mem {
+	frame_t capture[2][CAPTURE_FRAMES];
+	frame_t ring[RING_FRAMES];
+	unsigned char req_buf[2][REQ_BYTES];	/* alternate between requests */
+};
+#define MEM_SIZE	((sizeof(struct audio_mem) + 0xFFF) & ~0xFFF)
+
+/* taiHEN's module utilities (libtaihenModuleUtils_stub); not declared in
+ * vitasdk's headers. */
+int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid,
+			   uint32_t funcnid, uintptr_t *func);
+
+typedef int (*set_path_mode_fn)(int path, int mode);
+typedef int (*set_int_fn)(int value);
+typedef int (*monitor_read_fn)(int path, void *pcm, int frames);
+
+static set_path_mode_fn mon_set_path_mode;
+static set_int_fn mon_set_sample_rate;
+static set_int_fn mon_set_channel_mode;
+static monitor_read_fn mon_read;
 
 static SceUdcdEndpoint *audio_ep;
 static SceUID mem_uid = -1;
-static unsigned char *slot_data;	/* QUEUE * SLOT_STRIDE, physically contiguous */
-static SceUID ev_id = -1;
+static struct audio_mem *mem;
+static SceUID ev_id = -1;		/* USB thread */
+static SceUID cap_ev_id = -1;		/* capture thread */
 static SceUID thread_id = -1;
+static SceUID cap_thread_id = -1;
 
-static SceUdcdDeviceRequest reqs[QUEUE];
-static volatile unsigned int done_mask;		/* completed, not yet handled */
-static volatile int in_flight;
-static volatile int wanted;			/* the PC selected alternate 1 */
-static volatile int streaming;			/* our requests are queued */
+static SceUdcdDeviceRequest req;
+static volatile int owned;		/* SceUdcd holds req */
+static volatile int req_done;		/* req completed, not yet handled */
+static volatile int wanted;		/* the PC selected alternate 1 */
+static volatile int streaming;		/* our requests go out */
 static volatile int exiting;
+static volatile unsigned int state;	/* ST_CAPTURING and the sticky bits */
 
-static volatile unsigned int stat_packets;	/* since the last heartbeat */
-static volatile unsigned int stat_errors;	/* since start */
+/* Ring: the capture thread writes, the USB thread reads. Free-running
+ * indices; the writer publishes ring_w after the data, the reader ring_r. */
+static volatile unsigned int ring_w, ring_r;
+static int rebuffering = 1;		/* USB thread only */
 
-static void on_complete(SceUdcdDeviceRequest *req)
+/* Counted per heartbeat window (~500 ms). */
+static volatile unsigned int stat_packets;
+static volatile unsigned int stat_errors;	/* failed requests */
+static volatile unsigned int stat_xruns;
+static volatile int last_error;			/* last failure code */
+
+static void count(volatile unsigned int *c, unsigned int n)
 {
-	int slot = req - reqs;
+	__atomic_fetch_add(c, n, __ATOMIC_RELAXED);
+}
 
-	if (slot < 0 || slot >= QUEUE)
+/* ---- ring ---- */
+
+static void ring_push(const frame_t *src, unsigned int n)
+{
+	unsigned int w = ring_w;
+	unsigned int r = __atomic_load_n(&ring_r, __ATOMIC_ACQUIRE);
+	unsigned int first;
+
+	if (w - r + n > RING_FRAMES) {	/* the PC isn't reading */
+		count(&stat_xruns, 1);
 		return;
-	__atomic_fetch_or(&done_mask, 1u << slot, __ATOMIC_SEQ_CST);
-	__atomic_fetch_sub(&in_flight, 1, __ATOMIC_SEQ_CST);
+	}
+	first = RING_FRAMES - (w & RING_MASK);
+	if (first > n)
+		first = n;
+	memcpy(mem->ring[w & RING_MASK], src, first * sizeof(frame_t));
+	if (n > first)
+		memcpy(mem->ring[0], src + first, (n - first) * sizeof(frame_t));
+	__atomic_store_n(&ring_w, w + n, __ATOMIC_RELEASE);
+}
+
+/* Fill one request's worth of frames (silence while buffering). */
+static void ring_pop_request(unsigned char *dst)
+{
+	unsigned int r = ring_r;
+	unsigned int used = __atomic_load_n(&ring_w, __ATOMIC_ACQUIRE) - r;
+	unsigned int first;
+
+	if (rebuffering) {
+		if (used < RING_TARGET)
+			goto silence;
+		rebuffering = 0;
+	}
+	if (used < REQ_FRAMES) {	/* the Vita's clock is a bit slow */
+		count(&stat_xruns, 1);
+		rebuffering = 1;
+		goto silence;
+	}
+	if (used > RING_HIGH) {		/* a bit fast: skip, keep latency low */
+		count(&stat_xruns, 1);
+		r += used - RING_TARGET;
+	}
+	first = RING_FRAMES - (r & RING_MASK);
+	if (first > REQ_FRAMES)
+		first = REQ_FRAMES;
+	memcpy(dst, mem->ring[r & RING_MASK], first * sizeof(frame_t));
+	if (first < REQ_FRAMES)
+		memcpy(dst + first * sizeof(frame_t), mem->ring[0],
+		       (REQ_FRAMES - first) * sizeof(frame_t));
+	__atomic_store_n(&ring_r, r + REQ_FRAMES, __ATOMIC_RELEASE);
+	return;
+
+silence:
+	memset(dst, 0, REQ_BYTES);
+}
+
+/* ---- USB thread ---- */
+
+static void on_complete(SceUdcdDeviceRequest *r)
+{
+	(void)r;
+	__atomic_store_n(&req_done, 1, __ATOMIC_SEQ_CST);
+	__atomic_store_n(&owned, 0, __ATOMIC_SEQ_CST);
 	ksceKernelSetEventFlag(ev_id, EV_DONE);
 }
 
-static int submit(int slot)
+static int submit(unsigned char *data)
 {
-	unsigned char *data = slot_data + slot * SLOT_STRIDE;
 	int ret;
 
-	memset(data, 0, UAC_PACKET_BYTES);	/* step 1: silence */
-	ksceKernelDcacheCleanRange(data, SLOT_STRIDE);
-
-	reqs[slot] = (SceUdcdDeviceRequest){
+	ksceKernelDcacheCleanRange(data, REQ_BYTES);
+	req = (SceUdcdDeviceRequest){
 		.endpoint = audio_ep,
 		.data = data,
 		.attributes = SCE_UDCD_DEVICE_REQUEST_ATTR_PHYCONT,
-		.size = UAC_PACKET_BYTES,
+		.size = REQ_BYTES,
 		.isControlRequest = 0,
 		.onComplete = on_complete,
 		.transmitted = 0,
@@ -75,42 +218,35 @@ static int submit(int slot)
 		.unused = NULL,
 		.physicalAddress = NULL
 	};
-
-	__atomic_fetch_add(&in_flight, 1, __ATOMIC_SEQ_CST);
-	ret = ksceUdcdReqSend(&reqs[slot]);
+	__atomic_store_n(&owned, 1, __ATOMIC_SEQ_CST);
+	ret = ksceUdcdReqSend(&req);
 	if (ret < 0) {
-		__atomic_fetch_sub(&in_flight, 1, __ATOMIC_SEQ_CST);
-		stat_errors++;
+		__atomic_store_n(&owned, 0, __ATOMIC_SEQ_CST);
+		count(&stat_errors, 1);
+		last_error = ret;
 	}
 	return ret;
 }
 
-/* Cancel everything in flight and wait (bounded) for the completions. */
-static void stop_stream(void)
+/*
+ * A stream only works if it starts on a clean endpoint, with no request
+ * left from an earlier stream. When the PC closes the device the request is
+ * cancelled; when it opens it again, the stream starts once that request
+ * has come back, after clearing the endpoint. If that takes over a second,
+ * it starts anyway and says so (ST_STALE).
+ */
+static int usb_thread(SceSize args, void *argp)
 {
-	int ms;
-
-	ksceUdcdReqCancelAll(audio_ep);
-	for (ms = 0; ms < STOP_WAIT_MS &&
-	     __atomic_load_n(&in_flight, __ATOMIC_SEQ_CST) > 0; ms++)
-		ksceKernelDelayThread(1000);
-	ksceUdcdClearFIFO(audio_ep);
-	__atomic_store_n(&done_mask, 0, __ATOMIC_SEQ_CST);
-	__atomic_store_n(&in_flight, 0, __ATOMIC_SEQ_CST);
-	streaming = 0;
-}
-
-static int audio_thread(SceSize args, void *argp)
-{
-	unsigned int idle = 0;	/* slots not in flight while streaming */
-	int slot;
+	SceUInt64 wait_since = 0;	/* start: waiting for a leftover since */
+	int buf = 0;			/* req_buf to fill next */
+	int resend = 0;			/* last submission failed: same data */
 
 	(void)args;
 	(void)argp;
 
 	for (;;) {
-		unsigned int bits = 0, done;
-		SceUInt timeout = 10000;	/* retry idle slots every 10 ms */
+		unsigned int bits = 0;
+		SceUInt timeout = 10000;	/* retries and start waits */
 
 		ksceKernelWaitEventFlag(ev_id, EV_WAKE | EV_DONE | EV_EXIT,
 					SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
@@ -118,40 +254,180 @@ static int audio_thread(SceSize args, void *argp)
 		if (exiting)
 			break;
 
+		if (__atomic_exchange_n(&req_done, 0, __ATOMIC_SEQ_CST) && streaming) {
+			if (req.returnCode >= 0) {
+				count(&stat_packets, REQ_PACKETS);
+			} else {
+				count(&stat_errors, 1);
+				last_error = req.returnCode;
+			}
+		}
+
 		if (!wanted) {
-			if (streaming)
-				stop_stream();
-			idle = 0;
+			if (streaming) {
+				ksceUdcdReqCancelAll(audio_ep);
+				streaming = 0;
+			}
+			wait_since = 0;
 			continue;
 		}
 
 		if (!streaming) {
-			__atomic_store_n(&done_mask, 0, __ATOMIC_SEQ_CST);
+			SceUInt64 now = ksceKernelGetSystemTimeWide();
+
+			if (!wait_since) {
+				wait_since = now;
+				if (__atomic_load_n(&owned, __ATOMIC_SEQ_CST))
+					ksceUdcdReqCancelAll(audio_ep);
+			}
+			if (__atomic_load_n(&owned, __ATOMIC_SEQ_CST)) {
+				if (now - wait_since < START_WAIT_MS * 1000ULL)
+					continue;	/* the 10 ms timeout brings us back */
+				__atomic_fetch_or(&state, ST_STALE, __ATOMIC_RELAXED);
+			}
+			ksceUdcdClearFIFO(audio_ep);
+			/* Drop what an earlier stream left in the ring. */
+			__atomic_store_n(&ring_r, __atomic_load_n(&ring_w, __ATOMIC_ACQUIRE),
+					 __ATOMIC_RELEASE);
+			rebuffering = 1;
+			resend = 0;
+			wait_since = 0;
 			streaming = 1;
-			idle = (1u << QUEUE) - 1;
 		}
 
-		done = __atomic_exchange_n(&done_mask, 0, __ATOMIC_SEQ_CST);
-		for (slot = 0; slot < QUEUE; slot++) {
-			if (!(done & (1u << slot)))
-				continue;
-			if (reqs[slot].returnCode < 0)
-				stat_errors++;
-			else
-				stat_packets++;
-			idle |= 1u << slot;
+		if (__atomic_load_n(&owned, __ATOMIC_SEQ_CST))
+			continue;
+		if (!resend) {
+			buf ^= 1;
+			ring_pop_request(mem->req_buf[buf]);
 		}
-
-		for (slot = 0; slot < QUEUE && wanted; slot++) {
-			if ((idle & (1u << slot)) && submit(slot) >= 0)
-				idle &= ~(1u << slot);
-		}
+		resend = submit(mem->req_buf[buf]) < 0;	/* keep its samples */
 	}
-
-	if (streaming)
-		stop_stream();
 	return 0;
 }
+
+/* ---- capture thread ---- */
+
+static int resolve_monitor(void)
+{
+	if (mon_set_path_mode && mon_set_sample_rate && mon_set_channel_mode && mon_read)
+		return 1;
+	if (module_get_export_func(KERNEL_PID, "SceAudio", SCE_AUDIO_FOR_DRIVER,
+				   NID_SET_PATH_MODE, (uintptr_t *)&mon_set_path_mode) < 0 ||
+	    module_get_export_func(KERNEL_PID, "SceAudio", SCE_AUDIO_FOR_DRIVER,
+				   NID_SET_SAMPLE_RATE, (uintptr_t *)&mon_set_sample_rate) < 0 ||
+	    module_get_export_func(KERNEL_PID, "SceAudio", SCE_AUDIO_FOR_DRIVER,
+				   NID_SET_CHANNEL_MODE, (uintptr_t *)&mon_set_channel_mode) < 0 ||
+	    module_get_export_func(KERNEL_PID, "SceAudio", SCE_AUDIO_FOR_DRIVER,
+				   NID_MONITOR_READ, (uintptr_t *)&mon_read) < 0) {
+		mon_set_path_mode = NULL;
+		mon_read = NULL;
+		return 0;
+	}
+	return 1;
+}
+
+static int set_readback(void)
+{
+	int ret = mon_set_path_mode(MONITOR_PATH, MONITOR_MODE_READBACK);
+
+	if (ret >= 0)
+		ret = mon_set_sample_rate(UAC_RATE);
+	if (ret >= 0)
+		ret = mon_set_channel_mode(MONITOR_STEREO);
+	return ret;
+}
+
+static int read_block(int which)
+{
+	ksceKernelDcacheInvalidateRange(mem->capture[which], sizeof(mem->capture[which]));
+	return mon_read(MONITOR_PATH, mem->capture[which], CAPTURE_FRAMES);
+}
+
+/* Capture until the PC closes the device. */
+static void capture_stream(void)
+{
+	int cur, next, ret, discard, recoveries = 0, started = 0;
+
+	if (!resolve_monitor()) {
+		__atomic_fetch_or(&state, ST_NO_MONITOR, __ATOMIC_RELAXED);
+		return;		/* the USB thread streams silence */
+	}
+	if (set_readback() < 0)
+		goto failed;
+
+restart:
+	cur = 0;
+	discard = SETTLE_BLOCKS;
+	ret = read_block(cur);
+	if (ret != 0)
+		goto read_failed;
+	started = 1;
+	__atomic_fetch_or(&state, ST_CAPTURING, __ATOMIC_RELAXED);
+
+	while (wanted && !exiting) {
+		next = cur ^ 1;
+		/* Queues buf[next]; returns once buf[cur] is full. */
+		ret = read_block(next);
+		if (ret != 0)
+			goto read_failed;
+		ksceKernelDcacheInvalidateRange(mem->capture[cur], sizeof(mem->capture[cur]));
+		if (discard)
+			discard--;
+		else
+			ring_push((const frame_t *)mem->capture[cur], CAPTURE_FRAMES);
+		cur = next;
+	}
+	goto stop;
+
+read_failed:
+	if (ret == MONITOR_NOT_READBACK && recoveries < MAX_RECOVERIES &&
+	    wanted && !exiting) {
+		/* The system put the normal route back: take it again. */
+		recoveries++;
+		__atomic_fetch_or(&state, ST_RECOVERED, __ATOMIC_RELAXED);
+		started = 0;
+		if (set_readback() >= 0)
+			goto restart;
+	}
+failed:
+	__atomic_fetch_or(&state, ST_FAILED, __ATOMIC_RELAXED);
+stop:
+	__atomic_fetch_and(&state, ~ST_CAPTURING, __ATOMIC_RELAXED);
+	if (started)
+		mon_read(MONITOR_PATH, NULL, CAPTURE_FRAMES);	/* drain the queued block */
+	mon_set_path_mode(MONITOR_PATH, MONITOR_MODE_NORMAL);
+}
+
+static int capture_thread(SceSize args, void *argp)
+{
+	(void)args;
+	(void)argp;
+
+	for (;;) {
+		unsigned int bits = 0;
+		SceUInt timeout = 50000;
+
+		ksceKernelWaitEventFlag(cap_ev_id, EV_WAKE | EV_EXIT,
+					SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
+					&bits, &timeout);
+		if (exiting)
+			break;
+		if (!wanted)
+			continue;
+
+		__atomic_fetch_and(&state, ~(ST_RECOVERED | ST_NO_MONITOR | ST_FAILED),
+				   __ATOMIC_RELAXED);	/* ST_STALE stays until reboot */
+		capture_stream();
+		/* After a failure or with no monitor, wait for the PC to close. */
+		while (wanted && !exiting)
+			ksceKernelDelayThread(20000);
+	}
+	return 0;
+}
+
+/* ---- interface ---- */
+/* ---- interface ---- */
 
 int audio_init(SceUdcdEndpoint *ep)
 {
@@ -165,50 +441,63 @@ int audio_init(SceUdcdEndpoint *ep)
 	opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT |
 		   SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
 	opt.alignment = 4 * 1024;
-	mem_uid = ksceKernelAllocMemBlock("vitasync_audio", 0x10208006,
-					  4 * 1024, &opt);
+	mem_uid = ksceKernelAllocMemBlock("vitasync_audio", 0x10208006, MEM_SIZE, &opt);
 	if (mem_uid < 0)
 		return mem_uid;
-	ret = ksceKernelGetMemBlockBase(mem_uid, (void **)&slot_data);
+	ret = ksceKernelGetMemBlockBase(mem_uid, (void **)&mem);
 	if (ret < 0)
-		goto err_mem;
+		goto err;
 
 	ev_id = ksceKernelCreateEventFlag("vitasync_audio_ev", 0, 0, NULL);
-	if (ev_id < 0) {
-		ret = ev_id;
-		goto err_mem;
+	cap_ev_id = ksceKernelCreateEventFlag("vitasync_capture_ev", 0, 0, NULL);
+	if (ev_id < 0 || cap_ev_id < 0) {
+		ret = ev_id < 0 ? ev_id : cap_ev_id;
+		goto err;
 	}
 
-	thread_id = ksceKernelCreateThread("vitasync_audio", audio_thread,
+	thread_id = ksceKernelCreateThread("vitasync_audio", usb_thread,
 					   0x3C, 0x1000, 0, 0x10000, 0);
-	if (thread_id < 0) {
-		ret = thread_id;
-		goto err_ev;
+	cap_thread_id = ksceKernelCreateThread("vitasync_capture", capture_thread,
+					       0x3A, 0x2000, 0, 0x10000, 0);
+	if (thread_id < 0 || cap_thread_id < 0) {
+		ret = thread_id < 0 ? thread_id : cap_thread_id;
+		goto err;
 	}
 	ret = ksceKernelStartThread(thread_id, 0, NULL);
 	if (ret < 0)
-		goto err_thread;
+		goto err;
+	ret = ksceKernelStartThread(cap_thread_id, 0, NULL);
+	if (ret < 0)
+		goto err;
 	return 0;
 
-err_thread:
-	ksceKernelDeleteThread(thread_id);
-	thread_id = -1;
-err_ev:
-	ksceKernelDeleteEventFlag(ev_id);
-	ev_id = -1;
-err_mem:
-	ksceKernelFreeMemBlock(mem_uid);
-	mem_uid = -1;
-	slot_data = NULL;
+err:
+	audio_fini();
 	return ret;
 }
 
 void audio_fini(void)
 {
 	wanted = 0;
-	if (thread_id >= 0) {
-		exiting = 1;
+	exiting = 1;
+	if (ev_id >= 0)
 		ksceKernelSetEventFlag(ev_id, EV_EXIT);
+	if (cap_ev_id >= 0)
+		ksceKernelSetEventFlag(cap_ev_id, EV_EXIT);
+	if (audio_ep && __atomic_load_n(&owned, __ATOMIC_SEQ_CST)) {
+		int ms;
+
+		ksceUdcdReqCancelAll(audio_ep);
+		for (ms = 0; ms < STOP_WAIT_MS &&
+		     __atomic_load_n(&owned, __ATOMIC_SEQ_CST); ms++)
+			ksceKernelDelayThread(1000);
+	}
+	if (cap_thread_id >= 0) {
+		ksceKernelWaitThreadEnd(cap_thread_id, NULL, NULL);
+		ksceKernelDeleteThread(cap_thread_id);
+		cap_thread_id = -1;
+	}
+	if (thread_id >= 0) {
 		ksceKernelWaitThreadEnd(thread_id, NULL, NULL);
 		ksceKernelDeleteThread(thread_id);
 		thread_id = -1;
@@ -217,10 +506,15 @@ void audio_fini(void)
 		ksceKernelDeleteEventFlag(ev_id);
 		ev_id = -1;
 	}
-	if (mem_uid >= 0) {
+	if (cap_ev_id >= 0) {
+		ksceKernelDeleteEventFlag(cap_ev_id);
+		cap_ev_id = -1;
+	}
+	/* Never free memory SceUdcd may still send from. */
+	if (mem_uid >= 0 && !__atomic_load_n(&owned, __ATOMIC_SEQ_CST)) {
 		ksceKernelFreeMemBlock(mem_uid);
 		mem_uid = -1;
-		slot_data = NULL;
+		mem = NULL;
 	}
 }
 
@@ -229,17 +523,27 @@ void audio_set_streaming(int on)
 	wanted = on ? 1 : 0;
 	if (ev_id >= 0)
 		ksceKernelSetEventFlag(ev_id, EV_WAKE);
+	if (cap_ev_id >= 0)
+		ksceKernelSetEventFlag(cap_ev_id, EV_WAKE);
 }
 
-void audio_heartbeat(unsigned char *state, unsigned char *packets_div4,
-		     unsigned char *errors)
+static unsigned char take(volatile unsigned int *c, unsigned int div, unsigned int max)
 {
-	unsigned int packets = __atomic_exchange_n(&stat_packets, 0,
-						   __ATOMIC_SEQ_CST) / 4;
-	unsigned int err = stat_errors;
+	unsigned int v = __atomic_exchange_n(c, 0, __ATOMIC_RELAXED) / div;
 
-	*state = (unsigned char)((wanted ? 1 : 0) | (streaming ? 2 : 0) |
-				 (thread_id >= 0 ? 4 : 0));
-	*packets_div4 = (unsigned char)(packets > 255 ? 255 : packets);
-	*errors = (unsigned char)(err > 255 ? 255 : err);
+	return (unsigned char)(v > max ? max : v);
+}
+
+void audio_heartbeat(unsigned char *state_out, unsigned char *packets_div4,
+		     unsigned char *errors, unsigned char *xruns,
+		     unsigned char *last_error_low)
+{
+	*state_out = (unsigned char)((wanted ? ST_WANTED : 0) |
+				     (streaming ? ST_STREAMING : 0) |
+				     (thread_id >= 0 && cap_thread_id >= 0 ? ST_READY : 0) |
+				     __atomic_load_n(&state, __ATOMIC_RELAXED));
+	*packets_div4 = take(&stat_packets, 4, 255);
+	*errors = take(&stat_errors, 1, 255);
+	*xruns = take(&stat_xruns, 1, 15);
+	*last_error_low = (unsigned char)(last_error & 0xFF);
 }

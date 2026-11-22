@@ -5,7 +5,7 @@ LIBS	= -lSceSysmemForDriver_stub -lSceThreadmgrForDriver_stub \
 	-lSceDisplayForDriver_stub -lSceIftuForDriver_stub \
 	-lSceCtrlForDriver_stub -ltaihenForKernel_stub -lSceTouchForDriver_stub \
 	-lSceAppMgrForDriver_stub -lSceKernelSuspendForDriver_stub \
-	-lSceSysclibForDriver_stub
+	-lSceSysclibForDriver_stub -ltaihenModuleUtils_stub
 # SceSysclibForDriver must always be linked: it gives memset, memmove and
 # the division helpers from the kernel. Without it they come from vitasdk's
 # libc, which imports them from the user-mode SceLibKernel, and a kernel

@@ -890,7 +890,7 @@ static void pc_hid_send_input_heartbeat(void)
 	hb[61] = (unsigned char)((exit_game_request ? 8 : 0) |
 	                         ((kill_result & 3) << 4) |
 	                         ((exit_phase & 3) << 6));
-	hb[63] = 101; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight */
+	hb[63] = 105; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs) */
 
 	ep2_try_send(hb);
 	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;

@@ -28,6 +28,7 @@
 #include <psp2kern/kernel/threadmgr.h>
 #include <psp2kern/kernel/sysmem.h>
 #include <psp2kern/kernel/cpu.h>
+#include <psp2kern/kernel/suspend.h>
 #include <psp2kern/udcd.h>
 #include <taihen.h>
 #include <stdint.h>
@@ -66,6 +67,7 @@
 #define EV_EXIT		0x04
 
 #define STOP_WAIT_MS	500	/* module_stop: wait for a cancelled request */
+#define AWAKE_TICK_US	(10 * 1000 * 1000)
 #define START_WAIT_MS	1000	/* stream start: wait for a cancelled request */
 
 /* State bits (heartbeat). */
@@ -238,6 +240,7 @@ static int submit(unsigned char *data)
 static int usb_thread(SceSize args, void *argp)
 {
 	SceUInt64 wait_since = 0;	/* start: waiting for a leftover since */
+	SceUInt64 next_awake = 0;	/* next keep-awake tick */
 	int buf = 0;			/* req_buf to fill next */
 	int resend = 0;			/* last submission failed: same data */
 
@@ -293,6 +296,25 @@ static int usb_thread(SceSize args, void *argp)
 			resend = 0;
 			wait_since = 0;
 			streaming = 1;
+			/* Counts as activity: lights a screen that had gone dim
+			 * or dark, so the capture isn't of a sleeping Vita. */
+			ksceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
+			next_awake = 0;
+		}
+
+		/* Keep the Vita awake while the PC captures its sound: cancel
+		 * the power-save timers every 10 s. Done here and not in
+		 * uvc_thread, which can stall after the video stops (TODO.md);
+		 * uvc_thread does the same while the video streams. */
+		{
+			SceUInt64 now = ksceKernelGetSystemTimeWide();
+
+			if (now >= next_awake) {
+				ksceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+				ksceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_OLED_OFF);
+				ksceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_OLED_DIMMING);
+				next_awake = now + AWAKE_TICK_US;
+			}
 		}
 
 		if (__atomic_load_n(&owned, __ATOMIC_SEQ_CST))

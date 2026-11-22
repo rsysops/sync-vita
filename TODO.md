@@ -10,16 +10,35 @@ Sound works since plugin build 101 (`src/audio.c`). Still to do:
   volume bar appearing, in a quiet place, and correct it in `record`.
 - **Long captures.** 3 minutes showed no drift problem; check 30 minutes or
   more (the ring skips or rebuffers, counted in `status`).
-- **Keep the Vita awake while recording.** The plugin keeps it awake only
-  while input flows; a recording made after a while without input can show
-  the screen off (frozen picture, silence).
+- **Keep the Vita awake while recording.** Video capture keeps it awake
+  (uvc_thread, every 10 s); since build 105 sound capture does too (the
+  audio thread), with a wake tick when a sound capture starts. A Vita
+  already asleep before a *video* start still shows a frozen screen.
 
-## Video: the 2 ms wait after each frame conversion
+## Video: faster frames, and uvc_thread stalling after a stop
 
-`uvc_frame_transfer`'s caller waits 2 ms after the IFTU conversion. The wait
-came from the build that hid audio in the frames; its comment says the IFTU
-DMA finishes after the call returns. Try without it (or with a shorter
-wait), and measure the frame rate (`watch status`) and look for torn frames.
+`uvc_frame_transfer`'s caller waits 2 ms after each IFTU conversion (from
+the build that hid audio in the frames). Experimental builds 102-104
+(2026-11-22, withdrawn; build 105 = 101's video path) found:
+
+- **Without the wait** (102): 960x544 went from 47 to 52 frames/s, 896x504
+  to 59.6, 864x488 to 59.8, and a fast scroll showed no torn frame, so the
+  conversion is done when `ksceIftuCsc` returns. But a video start after a
+  few stop/starts went unanswered (`probe control: -110`), the heartbeat
+  stopped, and the Vita crashed about a minute later.
+- **A 250 ms limit on the frame send's wait, cancelling the request on
+  timeout from uvc_thread** (103): worse, a single stop led to a freeze and
+  a crash.
+- **Even on 101/105, uvc_thread seems to stall after a video stop**: no
+  heartbeat until the video restarts (`uvc_frame_req_submit_phycont` waits
+  for its completion with no limit; a frame queued just after the PC stops
+  reading never completes). With the 2 ms wait this stays harmless (10
+  stop/starts in a row fine on 105), and the next start unblocks it.
+
+Next: debug build (breadcrumbs: `bc_uvc_where`) to see where uvc_thread is
+after a stop, then make the frame path stop cleanly (check `stream` before
+each submit, release the wait from the abort path) before removing the wait
+again. 1280x720 stays out of `vitactl.py` until then.
 
 ## VitaShell's USB transfer freezes the Vita after the PC used the HID interface
 

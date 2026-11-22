@@ -80,10 +80,9 @@ RESEND_S = 0.1            # the plugin drops input after 1 s without reports
 SCREEN_W, SCREEN_H = 960, 544
 AUDIO_DEVICE = "hw:CARD=PSVita,DEV=0"   # the plugin's USB sound card (build 101+)
 # Sizes the plugin offers (scaled by the Vita's hardware), with the frames/s
-# measured over USB 2: 960x544 47, 896x504 54, 864x488 57, 480x272 60. The
-# plugin also offers 1280x720, left out on purpose: upscaled, 30 frames/s at
-# most, and it was the size being started when an experimental build hung
-# the plugin (TODO.md).
+# measured over USB 2: 960x544 47, 896x504 54, 864x488 57, 480x272 60.
+# (Plugin builds before 106 also offered 1280x720: upscaled, 30 frames/s at
+# most, and the size being started when an experimental build hung.)
 VIDEO_SIZES = ("960x544", "896x504", "864x488", "480x272")
 TOUCH_SCALE = 2           # touch grid is 1920x1088
 FRAME_MAX_AGE_S = 3.0     # older than this, the stream is considered stopped

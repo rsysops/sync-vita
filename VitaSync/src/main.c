@@ -66,7 +66,7 @@ static volatile unsigned int bc_ep0_head;
 #define UVC_DRIVER_NAME			"VITASYNC"
 #define UVC_USB_PID			0x1337
 
-#define MAX_UVC_VIDEO_FRAME_SIZE	VIDEO_FRAME_SIZE_NV12(1280, 720)
+#define MAX_UVC_VIDEO_FRAME_SIZE	VIDEO_FRAME_SIZE_NV12(960, 544)
 
 #define UVC_PAYLOAD_HEADER_SIZE		12
 #define UVC_PAYLOAD_SIZE(frame_size)	(UVC_PAYLOAD_HEADER_SIZE + (frame_size))
@@ -890,7 +890,7 @@ static void pc_hid_send_input_heartbeat(void)
 	hb[61] = (unsigned char)((exit_game_request ? 8 : 0) |
 	                         ((kill_result & 3) << 4) |
 	                         ((exit_phase & 3) << 6));
-	hb[63] = 105; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs) */
+	hb[63] = 106; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720 */
 
 	ep2_try_send(hb);
 	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;
@@ -1576,6 +1576,11 @@ static int send_frame(void)
 		const struct UVC_FRAME_UNCOMPRESSED(2) *frames =
 			video_streaming_descriptors.frames_uncompressed_nv12;
 		int cur_frame_index = uvc_probe_control_setting.bFrameIndex;
+		int frame_count = sizeof(video_streaming_descriptors.frames_uncompressed_nv12) /
+				  sizeof(video_streaming_descriptors.frames_uncompressed_nv12[0]);
+		/* The index comes from the PC: never read past the table. */
+		if (cur_frame_index < 1 || cur_frame_index > frame_count)
+			cur_frame_index = 1;
 		int dst_width = frames[cur_frame_index - 1].wWidth;
 		int dst_height = frames[cur_frame_index - 1].wHeight;
 

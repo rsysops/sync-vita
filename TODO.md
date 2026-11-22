@@ -38,7 +38,8 @@ the build that hid audio in the frames). Experimental builds 102-104
 Next: debug build (breadcrumbs: `bc_uvc_where`) to see where uvc_thread is
 after a stop, then make the frame path stop cleanly (check `stream` before
 each submit, release the wait from the abort path) before removing the wait
-again. 1280x720 stays out of `vitactl.py` until then.
+again. (1280x720, the size being started when 102 hung, was removed from
+the plugin in build 106; frame indexes from the PC are now range-checked.)
 
 ## VitaShell's USB transfer freezes the Vita after the PC used the HID interface
 
@@ -116,3 +117,9 @@ Every freeze followed HID use (`status` or input commands, which open
 To fetch a debug log after a freeze: boot with **L** held when leaving henlo's
 menu (so the plugin doesn't start a new log), copy `ur0:data/VitaSync_log.txt`
 to `ux0:` in VitaShell, then open USB transfer.
+
+##
+bug when rebooting
+test => ajouter audio
+readme
+no audio cut while recording

@@ -91,8 +91,8 @@ always 960x544 (scaled up); recordings keep the real size.
 | 864x488 | 57 |
 | 480x272 | 60 |
 
-The plugin also offers 1280x720, which `vitactl.py` leaves out: it's upscaled, 30
-frames/s at most (see TODO.md).
+Plugin builds before 106 also offered 1280x720 (upscaled, 30 frames/s at most);
+it was removed (see TODO.md).
 
 **Sound** (plugin build 101+). The Vita is also a USB sound card: Linux lists it
 as `card PSVita` (48 kHz, stereo, 16-bit), carrying the Vita's final mix (games,

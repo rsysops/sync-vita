@@ -1,60 +1,50 @@
 # VitaSync — PS Vita streaming & control over USB
 
-Stream the PS Vita screen to your PC **and** control the console (sticks, buttons,
-touch, triggers) over USB, all within a single Windows application.
+See the PS Vita's screen on a Linux PC **and** control the console (buttons,
+sticks, front and rear touch, PS and volume) over USB, from the command line.
 
 Prototype based on a modified fork of **`vita-udcd-uvc` 1.7** (`xerpi/vita-udcd-uvc`, MIT license).
 
-## Two components
+## What's in it
 
-- `VitaSync/` — Vita kernel plugin (`VitaSync.skprx`) : UVC + vendor HID USB
-  interface. UVC device name: `VITASYNC`, USB PID `0x1337`.
-- `windows/` — C#/.NET 8 WinForms application (`VitaSync.exe`): Media Foundation
-  video, HID (HidSharp), keyboard/mouse mapping, touch, F8 FPS mode, built-in
-  installation tutorial (5 pages, EN/FR/ES).
+- `VitaSync/` — Vita kernel plugin (`VitaSync.skprx`): UVC video + vendor HID
+  USB interface. UVC device name: `PSVita`, USB ID `054c:1337`.
+- `linux/` — `vitactl.py`, the command-line tool (screen, recordings, input),
+  and the udev rule it needs.
+- `TESTING.md` — an end-to-end test scenario; `TODO.md` — known problems and
+  next steps.
+- `.claude/skills/vita-testing/` — a Claude Code skill to test homebrew on the
+  Vita with all this.
 
 ## Installing the plugin on the Vita
 
-1. Copy `VitaSync.skprx` into `ur0:tai/` (VitaShell).
-2. Add to `ur0:tai/config.txt`:
+1. Build it: `./build-vita.sh` (see below).
+2. Copy `VitaSync/VitaSync.skprx` into `ur0:tai/` (VitaShell).
+3. Add to `ur0:tai/config.txt`:
 
    ```
    *KERNEL
    ur0:tai/VitaSync.skprx
    ```
 
-3. Reboot the Vita completely.
+4. Reboot the Vita completely (and run henlo, if that's how plugins load).
 
-> The tutorial's download button fetches the embedded plugin automatically and
-> copies it into your Downloads folder.
+The plugin takes USB over about 40 s after boot.
 
 ## Video troubleshooting
 
-Sometimes the video does not start on the first try. In that case, restart the
-video capture a few times (stop, then start again) until the image shows up.
-Don't hesitate to insist: it is a known behavior of the prototype, the image
-always eventually arrives.
-
-## Building the Windows application
-
-```powershell
-cd windows
-dotnet build -c Release
-```
-
-Executable: `windows\bin\Release\net8.0-windows10.0.22621.0\VitaSync.exe`
-(`VitaPCControl.csproj` is the historical project name; the executable is `VitaSync.exe`).
-
-User settings: `%APPDATA%\VitaSync\` (`sensitivity.txt`, `lang.txt`,
-`keymap.txt`, `tutoDone.txt`). The tutorial only appears once (via `tutoDone.txt`).
+If `vitactl.py watch start` fails, follow the advice it prints and try once
+more; don't retry in a loop (repeated quick attempts once crashed the Vita).
+Unplugging and replugging the cable often helps; otherwise power the Vita off
+and on.
 
 ## Linux
 
 On Linux, build the plugin with `./build-vita.sh` (Docker, `vitasdk/vitasdk:2026.08`;
-`./build-vita.sh DEBUG=1` adds a log in `ux0:dump/VitaSync_log.txt`).
+`./build-vita.sh DEBUG=1` adds a log in `ur0:data/VitaSync_log.txt`).
 
-`linux/vitactl.py` (Python 3, standard library and `ffmpeg`) replaces the Windows
-app from the command line: it saves the Vita's screen and sends input.
+`linux/vitactl.py` (Python 3, standard library and `ffmpeg`) saves the Vita's
+screen, records it, and sends input.
 
 1. Once, let your user send input and keep the Vita's USB awake:
 
@@ -102,10 +92,6 @@ Vita, with or without `vitactl.py`. Install it by copying the folder to
 > opening VitaShell's USB transfer can freeze the Vita (it crashes 30–60 s
 > later). Video alone is fine. In such a boot, copy files over VitaShell's FTP,
 > or reboot before opening USB transfer. Details and leads in [TODO.md](TODO.md).
-
-## Misc
-
-- `build` / `bin` folders intentionally ignored by Git (build artifacts).
 
 ## ⚠️ Warning
 

@@ -1,12 +1,3 @@
-# Visual Studio / .NET build outputs
-bin/
-obj/
-.vs/
-*.user
-*.suo
-TestResults/
-*.log
-
 # Vita plugin build artifacts (VitaSync)
 VitaSync/**/*.o
 VitaSync/**/*.d

@@ -24,11 +24,11 @@ controller directly performs a DMA transfer from the physical address of the res
 
 **Download**:
 
-* [VitaSync.skprx](https://github.com/jeff20001-new/VitaSync/releases)
+* Build it from the repository's root: `./build-vita.sh` (Docker, vitasdk image).
 
 **Compilation**
 
-* [vitasdk](https://vitasdk.org/) is needed.
+* [vitasdk](https://vitasdk.org/) is needed (`build-vita.sh` uses its Docker image).
 
 **Installation**:
 
@@ -43,8 +43,6 @@ ur0:tai/VitaSync.skprx
 ## Troubleshooting
 
 If the video looks glitched, try to change the video player configuration to use the *NV12* format or switch to another player (like PotPlayer or OBS). If the colors look wrong, set color range to full and color space to BT.601 (Rec. 601).
-
-If you use Windows 10 you might have to change the Camera access permissions on the Privacy Settings.
 
 On Linux I recommend using *mplayer* (`mplayer tv:// -tv driver=v4l2:device=/dev/videoX:width=960:height=544`).
 

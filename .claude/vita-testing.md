@@ -2,6 +2,15 @@
 
 Project facts for the `vita-testing` skill.
 
+## Connection
+
+```bash
+MOUNT=/media/ryan/352C-A00F        # ux0: over VitaShell's USB mode (lsusb 054c:05d3)
+VITA_IP=192.168.1.241              # VitaShell's FTP server
+FTP_PORT=1337
+VITACTL=/home/ryan/Documents/Loisirs/Jeux/PSVita/Dev/sync-vita/linux/vitactl.py
+```
+
 ## Folder on ux0:
 
 `downloads/` (`ux0:downloads/`). Debug builds write their log to
@@ -63,8 +72,9 @@ gamesd, PSVshell, kubridge). Nothing else on `ux0:` belongs to this project.
 
 ## What to test from
 
-`~/Desktop/vitasync-handoff.md`, "How to check it works". For the USB
-transfer freeze: `TODO.md`.
+`~/Desktop/vitasync-handoff.md`, "How to check it works". The end-to-end
+scenario (video, input, FTP): `TESTING.md`. For the USB transfer freeze:
+`TODO.md`.
 
 ## Reading results
 

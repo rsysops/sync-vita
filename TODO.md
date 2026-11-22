@@ -1,5 +1,14 @@
 # TODO
 
+## Audio to the PC
+
+The plugin doesn't send the Vita's sound to the PC. Its USB device has video
+and HID interfaces only, and the audio code in `VitaSync/src/main.c` is
+compiled out: `ENABLE_AUDIO_HOOKTRY 0` (no `sceAudioOutOutput` hook) and
+`ENABLE_AUDIO_STREAM 0` (no streaming). Enabling it is a task of its own: a
+USB audio interface (or audio over the HID endpoint), the hook, and a reader in
+`vitactl.py`. Step 2 of [TESTING.md](TESTING.md) waits for it.
+
 ## VitaShell's USB transfer freezes the Vita after the PC used the HID interface
 
 **The problem.** With the plugin running, opening VitaShell's USB transfer

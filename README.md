@@ -87,6 +87,13 @@ app from the command line: it saves the Vita's screen and sends input.
 Opening VitaShell's USB transfer takes USB away from the plugin; it takes USB
 back by itself a few seconds after the transfer is closed.
 
+[TESTING.md](TESTING.md) is a test scenario that checks video, input and
+VitaShell's FTP together.
+
+`.claude/skills/vita-testing/` is a Claude Code skill that tests a homebrew build on the
+Vita, with or without `vitactl.py`. Install it by copying the folder to
+`~/.claude/skills/`; each project describes itself in `.claude/vita-testing.md`.
+
 > **Known issue:** once `vitactl.py` has sent input or run `status` in a boot,
 > opening VitaShell's USB transfer can freeze the Vita (it crashes 30–60 s
 > later). Video alone is fine. In such a boot, copy files over VitaShell's FTP,

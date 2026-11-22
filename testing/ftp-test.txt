@@ -1,0 +1,7 @@
+sync-vita FTP test file
+Marker: VITACTL-FTP-7F3A
+Sent over FTP, read on screen
+by vitactl.py.
+Line 5: 0123456789
+Line 6: ABCDEFGHIJKLMNOPQRSTUVWXYZ
+End of file.

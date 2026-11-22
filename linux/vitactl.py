@@ -11,6 +11,11 @@ send it buttons, sticks and touches over USB.
   vitactl.py swipe [T] x1 y1 x2 y2 [ms]    one finger moving (default 300 ms)
   vitactl.py pinch [T] x y d1 d2 [ms]      two fingers spreading from d1 to d2 apart
   vitactl.py shot NAME                 save the next screen frame as NAME
+  vitactl.py record SECONDS FILE.mkv [--before S]
+                                       save every frame of the next SECONDS (and
+                                       of the S seconds before, up to 15) to FILE
+  vitactl.py analyze FILE.mkv          frame rate, freezes, sudden changes and
+                                       input-to-screen delays of a recording
   vitactl.py run FILE                  run commands from FILE (plus "wait ms")
   vitactl.py kill                      quit the game (only games that read touch)
   vitactl.py status                    devices, watch, and what the Vita reports
@@ -22,12 +27,16 @@ Touch positions are screenshot pixels (960x544). T is optional:
   --rear      the rear touchpad, at the point behind that screen pixel (build 91+)
   --force N   pressure 1-128 (default 128)
 
-Input works with or without `watch`; `shot` needs it. The plugin releases
+Input works with or without `watch`; `shot` and `record` need it. While it
+runs, `watch` also keeps every frame of the last ~20 s in memory, so `record
+--before` can save something that already happened. Input commands log their
+time, so a recording shows when each input was sent. The plugin releases
 all input when the video stream stops, so don't stop `watch` in the middle
 of an input command. Standard library only.
 """
 
 import glob
+import json
 import os
 import select
 import shlex
@@ -61,6 +70,10 @@ RESEND_S = 0.1            # the plugin drops input after 1 s without reports
 SCREEN_W, SCREEN_H = 960, 544
 TOUCH_SCALE = 2           # touch grid is 1920x1088
 FRAME_MAX_AGE_S = 3.0     # older than this, the stream is considered stopped
+RING_SEGMENTS = 20        # watch keeps this many 1 s pieces of full-rate video
+RING_FILES = RING_SEGMENTS + 2   # never list the piece being written
+RECORD_BEFORE_MAX_S = 15
+INPUT_COMMANDS = ("press", "hold", "stick", "touch", "touch2", "swipe", "pinch", "kill")
 UDEV_HINT = ("install the udev rule: sudo cp linux/70-vitasync.rules /etc/udev/rules.d/ "
              "&& sudo udevadm control --reload && sudo udevadm trigger")
 
@@ -175,10 +188,25 @@ def watch_start():
         raise VitaError("Vita video not found (no /dev/video* named PSVita). Is the plugin running?")
     latest = state_file("latest.png")
     log_path = state_file("ffmpeg.log")
+    ring = ring_dir()
+    shutil.rmtree(ring, ignore_errors=True)
+    os.makedirs(ring)
+    # One process, one stream: latest.png at 3 fps for `shot`, and every frame
+    # in 1 s pieces stamped with wall-clock time (-ts mono2abs, -copyts) for
+    # `record`. Each piece starts at time 0 (concat needs real lengths); the
+    # list keeps its wall-clock start. The pieces wrap around, so memory use
+    # stays bounded.
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
-           "-f", "v4l2", "-input_format", "nv12", "-video_size", f"{SCREEN_W}x{SCREEN_H}",
-           "-i", video, "-vf", "fps=3",
-           "-f", "image2", "-update", "1", "-atomic_writing", "1", latest]
+           "-f", "v4l2", "-ts", "mono2abs", "-input_format", "nv12",
+           "-video_size", f"{SCREEN_W}x{SCREEN_H}", "-i", video, "-copyts",
+           "-map", "0:v", "-vf", "fps=3",
+           "-f", "image2", "-update", "1", "-atomic_writing", "1", latest,
+           "-map", "0:v", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12",
+           "-g", "10", "-fps_mode", "passthrough",
+           "-f", "segment", "-segment_time", "1", "-segment_wrap", str(RING_FILES),
+           "-segment_format", "matroska", "-reset_timestamps", "1",
+           "-segment_list", os.path.join(ring, "list.csv"), "-segment_list_type", "csv",
+           "-segment_list_size", str(RING_SEGMENTS), os.path.join(ring, "%03d.mkv")]
     # A single attempt: on 2026-11-21, three quick retries after the Vita
     # stopped answering video setup requests were followed by a crash.
     started = time.time()
@@ -251,6 +279,277 @@ def shot(name):
             pass
         time.sleep(0.05)
     raise VitaError("no new frame within 3 s; is watch still running?")
+
+
+# ---- recording ----
+
+def ring_dir():
+    return state_file("ring")
+
+
+def log_input(argv):
+    """Note when an input command starts, for `record`. Kept short."""
+    path = state_file("inputs.log")
+    try:
+        if os.path.getsize(path) > 200_000:
+            with open(path) as f:
+                keep = f.readlines()[-500:]
+            with open(path, "w") as f:
+                f.writelines(keep)
+    except OSError:
+        pass
+    with open(path, "a") as f:
+        f.write(f"{time.time():.3f}\t{' '.join(argv)}\n")
+
+
+def inputs_between(t0, t1):
+    out = []
+    try:
+        with open(state_file("inputs.log")) as f:
+            for line in f:
+                stamp, _, what = line.rstrip("\n").partition("\t")
+                t = float(stamp)
+                if t0 <= t <= t1:
+                    out.append({"t": round(t - t0, 3), "input": what})
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def ring_pieces():
+    """[(file, start, end)] in wall-clock seconds, oldest first."""
+    out = []
+    try:
+        with open(os.path.join(ring_dir(), "list.csv")) as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) == 3:
+                    out.append((os.path.join(ring_dir(), parts[0]),
+                                float(parts[1]), float(parts[2])))
+    except (OSError, ValueError):
+        return []
+    return out
+
+
+def run_quiet(cmd, what):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        tail = "\n  ".join(r.stderr.strip().splitlines()[-4:])
+        raise VitaError(f"{what} failed:\n  {tail}")
+    return r
+
+
+def cmd_record(args):
+    before = 0.0
+    if "--before" in args:
+        i = args.index("--before")
+        if i + 1 >= len(args):
+            raise VitaError("--before needs seconds")
+        try:
+            before = float(args[i + 1])
+        except ValueError:
+            raise VitaError(f"bad --before {args[i + 1]!r}")
+        args = args[:i] + args[i + 2:]
+    if len(args) != 2:
+        raise VitaError("usage: record SECONDS FILE.mkv [--before S]")
+    try:
+        secs = float(args[0])
+    except ValueError:
+        raise VitaError(f"bad SECONDS {args[0]!r}")
+    if not 0 <= secs <= 300 or not 0 <= before <= RECORD_BEFORE_MAX_S or secs + before <= 0:
+        raise VitaError(f"SECONDS must be 0-300 and --before 0-{RECORD_BEFORE_MAX_S}, not both 0")
+    record(secs, args[1], before)
+
+
+def record(secs, name, before):
+    need_watch()
+    now = time.time()
+    t0, t1 = now - before, now + secs
+    tmp = os.path.join(state_dir(), f"rec-{os.getpid()}")
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        # Copy each piece as soon as it is complete: the ring wraps after
+        # about RING_FILES seconds, so long recordings can't wait until the end.
+        saved = {}   # start -> (copy, start, end)
+        deadline = t1 + 5
+        while True:
+            for path, start, end in ring_pieces():
+                if end > t0 and start < t1 and start not in saved:
+                    copy = os.path.join(tmp, f"{len(saved):04d}.mkv")
+                    shutil.copyfile(path, copy)
+                    saved[start] = (copy, start, end)
+            if saved and max(e for _, _, e in saved.values()) >= t1:
+                break
+            if time.time() > deadline:
+                raise VitaError("the video pieces stopped coming; is watch still running?")
+            time.sleep(0.2)
+        pieces = sorted(saved.values(), key=lambda p: p[1])
+        first = pieces[0][1]
+        if first > t0 + 0.2:
+            print(f"note: frames only from {first - t0:.1f} s after the requested start "
+                  "(watch started recently)")
+        listing = os.path.join(tmp, "list.txt")
+        with open(listing, "w") as f:
+            f.writelines(f"file '{p[0]}'\n" for p in pieces)
+        start = max(t0, first) - first
+        run_quiet(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                   "-f", "concat", "-safe", "0", "-i", listing,
+                   "-vf", f"trim=start={start:.3f}:end={start + (t1 - max(t0, first)):.3f},"
+                          "setpts=PTS-STARTPTS",
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "12",
+                   "-fps_mode", "passthrough", name], "saving the recording")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    t0 = max(t0, first)
+    info = {"start": round(t0, 3), "seconds": round(t1 - t0, 3),
+            "inputs": inputs_between(t0, t1)}
+    with open(name + ".json", "w") as f:
+        json.dump(info, f, indent=1)
+    frames = frame_times(name)
+    print(f"{name}: {len(frames)} frames over {t1 - t0:.1f} s, "
+          f"{len(info['inputs'])} inputs (in {name}.json)")
+
+
+# ---- analysis ----
+
+def frame_times(name):
+    r = run_quiet(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                   "-show_entries", "frame=best_effort_timestamp_time",
+                   "-of", "csv=p=0", name], "reading frame times")
+    out = []
+    for line in r.stdout.split():
+        field = line.split(",")[0]
+        if field not in ("", "N/A"):
+            out.append(float(field))
+    return out
+
+
+def filter_times(name, vf, key):
+    """Run a filter chain ending in a logging filter; return what it logged
+    for each frame, as {time: text after key}."""
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-i", name, "-vf", vf,
+                        "-f", "null", "-"], capture_output=True, text=True)
+    out = []
+    for line in r.stderr.splitlines():
+        if key in line:
+            out.append(line)
+    return out
+
+
+SMALL_W, SMALL_H = 120, 68   # analysis works on small grey frames
+
+
+def small_frames(name):
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", name,
+                        "-vf", f"scale={SMALL_W}:{SMALL_H},format=gray", "-fps_mode", "passthrough",
+                        "-f", "rawvideo", "-"], capture_output=True)
+    size = SMALL_W * SMALL_H
+    return [r.stdout[i:i + size] for i in range(0, len(r.stdout) - size + 1, size)]
+
+
+def changed(a, b):
+    """Share of pixels that changed clearly between two small frames."""
+    return sum(1 for x, y in zip(a, b) if abs(x - y) > 24) / len(a)
+
+
+def input_response(times, small, t_in, events):
+    """When the screen first reacts to an input: the first frame that differs
+    from the one at the input by more than the screen changes by itself in
+    the 0.3 s before it."""
+    if not small:
+        return "no frame comparison"
+    ref = max((i for i, t in enumerate(times) if t <= t_in), default=None)
+    if ref is None:
+        return "sent before the recording started"
+    start = max((i for i, t in enumerate(times) if t <= t_in - 0.3), default=0)
+    by_itself = max((changed(small[start], small[j]) for j in range(start, ref + 1)), default=0)
+    for j in range(ref + 1, len(times)):
+        if times[j] > t_in + 1.5:
+            break
+        if changed(small[ref], small[j]) > max(by_itself + 0.02, 0.02):
+            events.append((times[j], "response"))
+            return f"screen reacts {(times[j] - t_in) * 1000:.0f} ms later"
+    return "no visible reaction within 1.5 s"
+
+
+def analyze(name):
+    if not os.path.exists(name):
+        raise VitaError(f"no such file: {name}")
+    info = {}
+    try:
+        with open(name + ".json") as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        pass
+    times = frame_times(name)
+    if len(times) < 2:
+        raise VitaError("fewer than 2 frames in the recording")
+    duration = times[-1] - times[0]
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    typical = sorted(gaps)[len(gaps) // 2]
+
+    # Pictures that differ from the one before (mpdecimate drops repeats).
+    unique = []
+    for line in filter_times(name, "mpdecimate,showinfo", "pts_time:"):
+        try:
+            unique.append(float(line.split("pts_time:")[1].split()[0]))
+        except (IndexError, ValueError):
+            pass
+    # Sudden changes: a quarter of the screen or more changing in one frame
+    # (cuts, flashes, a dialog appearing).
+    small = small_frames(name)
+    if len(small) != len(times):
+        small = []
+    changes = [(times[i], changed(small[i - 1], small[i]))
+               for i in range(1, len(small)) if changed(small[i - 1], small[i]) >= 0.25]
+
+    lines = [f"{name}: {len(times)} frames over {duration:.2f} s"]
+    lines.append(f"stream: {len(times) / duration:.1f} frames/s delivered, "
+                 f"typical gap {typical * 1000:.0f} ms, longest {max(gaps) * 1000:.0f} ms")
+    late = [(times[i], g) for i, g in enumerate(gaps) if g > max(2.5 * typical, 0.05)]
+    for t, g in late[:10]:
+        lines.append(f"  stream gap: {g * 1000:.0f} ms after {t:.3f} s (frames lost or late on USB)")
+    events = []
+    if unique:
+        lines.append(f"picture: {len(unique)} different pictures, "
+                     f"{len(unique) / duration:.1f}/s on average (the game's real frame rate, "
+                     "if the screen moves all the time)")
+        per_s = {}
+        for t in unique:
+            per_s[int(t)] = per_s.get(int(t), 0) + 1
+        lines.append("  per second: " + " ".join(f"{per_s.get(s, 0)}" for s in range(int(duration) + 1)))
+        holds = [(a, b - a) for a, b in zip(unique, unique[1:] + [times[-1]]) if b - a >= 0.1]
+        for t, h in holds[:15]:
+            lines.append(f"  unchanged for {h * 1000:.0f} ms from {t:.3f} s")
+            events.append((t + h, "after-still"))
+    for t, share in changes[:15]:
+        lines.append(f"  sudden change at {t:.3f} s ({share * 100:.0f}% of the screen)")
+        events.append((max(t - typical, 0), "before-change"))
+        events.append((t, "change"))
+    for inp in info.get("inputs", []):
+        lines.append(f"  input at {inp['t']:.3f} s: {inp['input']}, " + input_response(times, small, inp["t"], events))
+
+    if not small:
+        lines.append("  (frame comparison skipped: frame count mismatch)")
+    out = os.path.splitext(name)[0] + "-analysis"
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    for i, (t, kind) in enumerate(sorted(set(events))[:24], 1):
+        run_quiet(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                   "-ss", f"{t:.3f}", "-i", name, "-frames:v", "1",
+                   os.path.join(out, f"{i:02d}-{t:07.3f}s-{kind}.png")], "saving a frame")
+    # One overview sheet: 16 frames spread over the recording, 4x4, 960x544.
+    step = max(len(times) // 16, 1)
+    run_quiet(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", name,
+               "-vf", f"select='not(mod(n\\,{step}))',scale=240:136,tile=4x4",
+               "-fps_mode", "passthrough", "-frames:v", "1", os.path.join(out, "sheet.png")],
+              "making the overview sheet")
+    lines.append(f"sheet.png: 16 frames, one every {step * duration / len(times):.2f} s, "
+                 "left to right, top to bottom")
+    lines.append(f"pictures and this report: {out}/")
+    with open(os.path.join(out, "report.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
 
 
 # ---- input ----
@@ -537,6 +836,8 @@ def run_command(argv):
     if not argv:
         raise VitaError("no command; see vitactl.py --help")
     cmd, args = argv[0].lower(), argv[1:]
+    if cmd in INPUT_COMMANDS:
+        log_input(argv)
     if cmd == "watch":
         sub = args[0] if args else ""
         if sub == "start":
@@ -565,6 +866,12 @@ def run_command(argv):
         if len(args) != 1:
             raise VitaError("usage: shot NAME")
         shot(args[0])
+    elif cmd == "record":
+        cmd_record(args)
+    elif cmd == "analyze":
+        if len(args) != 1:
+            raise VitaError("usage: analyze FILE.mkv")
+        analyze(args[0])
     elif cmd == "kill":
         cmd_kill()
     elif cmd == "status":

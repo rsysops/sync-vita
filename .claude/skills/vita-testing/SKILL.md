@@ -189,7 +189,11 @@ Tell the user, in a few numbered lines:
 4. **Run the test** the current step needs (the project file's **What to
    test from**), with `press`, `hold`, `stick`, `touch`, `swipe` and `run`.
    Say what each shot shows. If something unexpected appears (a dialog, a
-   crash, an error code), stop and show it to the user.
+   crash, an error code), stop and show it to the user. For anything shorter
+   than a second (a flash, a hitch, a stutter) or to measure frame rate:
+   `$VITACTL record SECONDS "$DEST/<what>.mkv" [--before S]` (in the
+   background, `&`, while `run` plays the inputs), then `$VITACTL analyze`
+   on it, and look at the pictures it flags rather than at every frame.
 5. **When done:** quit the app (`press PS`, then close it if needed). From
    now on this boot is **FTP only** (freeze). Open VitaDeploy from LiveArea
    (find its bubble in a shot, `touch` it, start it), choose **File

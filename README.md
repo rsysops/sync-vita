@@ -79,6 +79,10 @@ app from the command line: it saves the Vita's screen and sends input.
    ./linux/vitactl.py pinch 480 272 100 400          # two fingers spreading: zoom in
    ./linux/vitactl.py touch --rear --force 64 480 272   # rear touchpad, behind that pixel
    ./linux/vitactl.py shot menu.png   # the next frame, taken after the last input
+   ./linux/vitactl.py record 3 clip.mkv --before 2   # every frame (~47/s) of the next 3 s
+                                      # and the 2 s before; inputs noted in clip.mkv.json
+   ./linux/vitactl.py analyze clip.mkv   # frame rate, freezes, sudden changes, input delays,
+                                         # with pictures of each in clip-analysis/
    ./linux/vitactl.py run steps.txt   # one command per line, plus "wait ms"
    ./linux/vitactl.py status          # devices, video, and what the plugin reports
    ./linux/vitactl.py watch stop

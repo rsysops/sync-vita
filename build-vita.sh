@@ -14,7 +14,9 @@ docker run --rm \
     --user "$(id -u):0" \
     "$IMAGE" \
     bash -c '
-        make clean "$@" && make "$@"
+        set -e
+        make clean "$@"
+        make "$@"
         # A kernel plugin must import only kernel libraries; a user-mode
         # SceLibKernel import builds fine but the plugin fails on the Vita.
         if arm-vita-eabi-objdump -h VitaSync.elf | grep -q "fstubs\.SceLibKernel"; then

@@ -14,6 +14,7 @@
 #include <psp2/touch.h>
 #include "usb_descriptors.h"
 #include "uvc.h"
+#include "audio.h"
 
 /* Debug log (make DEBUG=1): lines are buffered and written to
  * ux0:dump/VitaSync_log.txt by DFLUSH(), or by DFLUSH_SAFE() once VitaShell's
@@ -145,13 +146,6 @@ static SceUID uvc_event_flag_id;
 static int uvc_thread_run;
 static int stream;
 
-/* Worker audio d�di� (architecture psvita-usb-audio-midi) : l'envoi
- * USB ne doit PAS vivre dans uvc_thread � ce thread ne se r�veille
- * qu'au rythme des frames vid�o (~30 Hz), et son contexte est li� au
- * callback vblank. Un worker ind�pendant boucle � intervalle fixe. */
-static SceUID audio_thread_id = -1;
-static volatile int audio_thread_run;
-
 static SceUID uvc_frame_buffer_uid = -1;
 static struct uvc_frame *uvc_frame_buffer_addr;
 SceUID uvc_frame_req_evflag;
@@ -240,329 +234,6 @@ static volatile int exit_phase;
 static volatile SceUID exit_target_pid;
 static unsigned int kill_hold;             /* boucles de gel vid�o restantes */
 
-#define ENABLE_AUDIO_CAPTURE 1 /* gardé pour declarations */
-#define ENABLE_AUDIO_PUSH 0
-#define ENABLE_AUDIO_PIDGRAB 0
-#define ENABLE_AUDIO_HOOKTRY 0
-#define ENABLE_AUDIO_BISECT_PASSTHRU 0
-#define ENABLE_AUDIO_RECORDERS 0
-#define ENABLE_AUDIO_STREAM 0
-#define ENABLE_AUDIO_MUTE 0
-#define ENABLE_AUDIO_INJECT 0
-#define AUD_BISECT_SKIP_RING 0 /* terminé : ring retiré du chemin data */
-#define AUD_BISECT_SILENT_PUBLISH 0 /* terminé */
-#define AUD_BISECT_PROBE_ONLY 1 /* bisecte 75 : 1 seule lecture pBuffer */
-#if ENABLE_AUDIO_CAPTURE
-/* ---- Audio redirection ----
- * Hook sceAudioOutOutput: convert the game's PCM to 24 kHz mono s16,
- * queue it for the HID IN pipe (report id 1), then silence the local
- * buffer so audio plays ONLY on the PC. */
-static tai_hook_ref_t audio_out_ref;
-static SceUID audio_out_hook_uid = -1;
-/* SIGNATURE RÉELLE (cf. VITA2PC) : sceAudioOutOutput n'a que DEUX
- * paramètres — la taille vient du GRANULE du port fixé à l'OpenPort.
- * Notre ancien 3e argument fantôme lisait un registre résiduel :
- * valeurs absurdes (etat=6) et lectures hors buffer = panics. */
-typedef int (*audio_out_fn_t)(int, const void *);
-
-/* GetConfig : source de vérité du driver (NID 0x9C8EDAEA).
- * Déclaré tôt car l'hook Output l'appelle dans le contexte du jeu. */
-typedef int (*audio_getcfg_fn_t)(int, int);
-static tai_hook_ref_t audio_getcfg_ref;
-static SceUID audio_getcfg_uid = -1;
-#define ARING_SIZE 8192
-#define ARING_MASK (ARING_SIZE - 1)
-/* Petit anneau statique (8 Ko ~ 170 ms) : reste sous les limites de
- * chargement du module, contrairement aux 32 Ko qui faisaient �chouer
- * l'�num�ration. */
-static unsigned char aring[ARING_SIZE] __attribute__((aligned(64)));
-static volatile unsigned int ar_head, ar_tail;
-/* Mutex kernel : le hook tourne sur les c�urs des threads du jeu, le
- * worker audio sur un autre. Les barri�res compilateur seules ont
- * montr� leurs limites (hook voyait � plein �, worker voyait � vide �
- * simultan�ment) � le mutex SceThreadmgr impose la coh�rence r�elle
- * entre c�urs autour de chaque section critique. */
-static SceUID aring_mutex = -1;
-/* M�moire des param�tres par NUM�RO DE PORT (pas par PID).
- * Le pilote audio est unique : tous les processus qui jouent sur
- * le m�me num�ro de port utilisent la m�me config mat�rielle.
- * Quand Output cr�e un slot fra�chement (pid inconnu), il emprunte
- * ces valeurs au lieu de rester � ch=0 fr=0 ? etat=2. */
-static int port_ch_mem[8];  /* 0 = jamais vu */
-static int port_fr_mem[8];
-static volatile int audio_capture_on;
-static unsigned char audio_seq;
-static volatile int audio_mod_found;
-static tai_hook_ref_t audio_open_ref, audio_setcfg_ref;
-static SceUID audio_open_uid = -1, audio_setcfg_uid = -1;
-typedef int (*audio_open_fn_t)(int, int, int, int);
-typedef int (*audio_setcfg_fn_t)(int, unsigned int, int, int);
-
-/* Diag audio (hb[59] bas): 0=pas d'appel 1=port invalide 2=params absents
- * 3=taille non confirm�e 4=nouvelle taille apprise 5=lecture OK */
-static volatile unsigned char aud_diag;
-static volatile unsigned char aud_diag_port;
-static volatile unsigned int aud_pushes;
-static volatile unsigned char usb_audio_ok_cnt;  /* successful EP2 sends per 500ms */
-static volatile unsigned char usb_audio_ring;    /* ring fill level at drain time */
-static volatile unsigned char n_real_calls;      /* appels Output avec vrai buffer / fenêtre */
-static volatile unsigned char n_push_ok;         /* pushes ayant réellement écrit / fenêtre */
-static volatile unsigned char n_null_calls;      /* appels bloquants NULL / fenêtre */
-static volatile unsigned char n_pub_chunks;      /* chunks publiés par le hook / fenêtre */
-static volatile unsigned char n_enc_frames;      /* frames vidéo encodées avec payload / fenêtre */
-
-/* ---- Registre de ports audio SPARSES (architecture EQVita) ----
- * Les IDs de ports Vita ne sont pas bornés à 0..7 : des valeurs comme
- * 256 existent. Ancien gate port<=7 = musique du jeu rejetée. Nouveau
- * registre : table plate indexée par le NUMÉRO DE PORT seul (pas de
- * PID — un syscall par appel audio dans le chemin chaud est interdit).
- * Entrées neuves : fallback stéréo 48 kHz, raffiné par les
- * enregistreurs OpenPort/SetConfig quand ils voient une ouverture. */
-#define APORT_MAX 16
-struct aport_state {
-	int port;                   /* -1 = entrée libre */
-	unsigned char pid;          /* propriétaire (processus) : DEUX
-				     * processus peuvent utiliser LE MÊME
-				     * numéro de port avec des allocations
-				     * différentes — sans ce clé, l'entrée
-				     * du jeu décrivait le buffer UI et
-				     * inversement = data aborts 74/76 */
-	int ch, fr;
-	int granule;                /* frames par buffer */
-	unsigned char learned;      /* 1 = config posée par NOS hooks */
-	SceUInt64 last_real_us;
-};
-static struct aport_state aport_tab[APORT_MAX];
-
-static struct aport_state *aport_get(int port, unsigned char pid)
-{
-	struct aport_state *free_s = NULL, *oldest = NULL;
-	int k;
-
-	if (aring_mutex >= 0)
-		ksceKernelLockMutex(aring_mutex, 0, NULL);
-
-	for (k = 0; k < APORT_MAX; k++) {
-		if (aport_tab[k].port == port &&
-		    aport_tab[k].pid == pid) {
-			aport_tab[k].last_real_us =
-				ksceKernelGetSystemTimeWide();
-			free_s = &aport_tab[k];
-			goto found;
-		}
-		if (aport_tab[k].port < 0 && !free_s)
-			free_s = &aport_tab[k];
-		if (!oldest ||
-		    aport_tab[k].last_real_us < oldest->last_real_us)
-			oldest = &aport_tab[k];
-	}
-	if (!free_s)
-		free_s = oldest;
-	free_s->port = port;
-	free_s->pid = pid;
-	free_s->ch = 2;
-	free_s->fr = 48000;
-	free_s->granule = 0;
-	free_s->learned = 0;
-	free_s->last_real_us = 0;
-found:
-	if (aring_mutex >= 0)
-		ksceKernelUnlockMutex(aring_mutex, 0);
-	return free_s;
-}
-
-static void aport_set_params(int p, int ch, int fr, int granule,
-			     unsigned char pid)
-{
-	struct aport_state *s;
-
-	if (p < 0)
-		return;
-	if (ch != 1 && ch != 2)
-		ch = 2;
-	if (fr < 8000 || fr > 192000)
-		fr = 48000;
-	s = aport_get(p, pid);
-	if (s) {
-		s->ch = ch;
-		s->fr = fr;
-		if (granule > 0 && granule <= 16384)
-			s->granule = granule;
-		s->learned = 1; /* config certifiée par nos hooks */
-	}
-	if (p <= 7) {
-		port_ch_mem[p] = ch;
-		port_fr_mem[p] = fr;
-	}
-}
-
-static int audio_ring_ensure(void)
-{
-	/* Anneau statique : rien � allouer. */
-	ar_head = ar_tail = 0;
-	return 0;
-}
-
-static void audio_ring_free(void)
-{
-	ar_head = ar_tail = 0;
-}
-
-/* ---- Injection audio DANS LES FRAMES VIDÉO (option 2) ----
- * Le PCM voyage caché dans les 8 dernières lignes de la plane Y du
- * frame NV12, encodé 2 bits/pixel sur 4 niveaux de gris très espacés
- * {25,95,165,235} → survit à toute conversion YUV→RGB côté PC.
- * Capacité : 960px × 8 lignes × 30fps × 2b = ~57 Ko/s > 48 requis.
- * Zéro nouveau canal USB, zéro hook supplémentaire : on surfe sur le
- * flux vidéo, stable depuis le jour un. */
-#define AUD_ROWS        8
-#define AUD_PAYLOAD_CAP 1728   /* octets PCM par frame (≈51 Ko/s @30fps) */
-#define AUD_HDR_LEN     6      /* 'A','V',seq,len_lo,len_hi,sum */
-
-static unsigned char aud_frame_seq;
-static unsigned char aud_inject_hdr[AUD_HDR_LEN];
-static unsigned char aud_bounce[2048 * 2]; /* copie protégée de pBuffer */
-
-/* Double-buffer publié par le hook audio, consommé par le chemin
- * vidéo SANS AUCUN VERROU. Lock-free SPSC. */
-static unsigned char aud_stage[2][AUD_HDR_LEN + AUD_PAYLOAD_CAP];
-static volatile unsigned int aud_stage_len[2];
-static volatile unsigned int aud_stage_seq;
-static unsigned int aud_stage_read_seq;
-
-static void inject_audio_rows(unsigned char *nv12, int W, int H)
-{
-	unsigned int total, si, di;
-	int row, col;
-	unsigned char *ybase;
-	unsigned char crc;
-	unsigned int s0, idx0, idx1, pay_len;
-	const unsigned char *b0, *b1;
-	unsigned int len0, len1;
-
-	if (!nv12 || W < 320 || H <= AUD_ROWS)
-		return;
-
-	/* Lecture lock-free des 2 slots du double-buffer. */
-	s0 = aud_stage_seq;
-	idx0 = s0 & 1;
-	len0 = aud_stage_len[idx0];
-	b0 = aud_stage[idx0];
-	idx1 = (s0 - 1) & 1;
-	len1 = (s0 > 0) ? aud_stage_len[idx1] : 0;
-	b1 = (s0 > 0 && len1 > 0) ? aud_stage[idx1] : NULL;
-
-	pay_len = 0;
-	if (b0 != NULL && len0 > 0) {
-		unsigned int j;
-		for (j = 0; j < len0 && pay_len < AUD_PAYLOAD_CAP; j++)
-			aud_bounce[pay_len++] = b0[AUD_HDR_LEN + j];
-	}
-	if (b1 != NULL && len1 > 0) {
-		unsigned int j;
-		for (j = 0; j < len1 && pay_len < AUD_PAYLOAD_CAP; j++)
-			aud_bounce[pay_len++] = b1[AUD_HDR_LEN + j];
-	}
-	if (pay_len > 0 && n_enc_frames < 255)
-		n_enc_frames++;
-
-	crc = 0;
-	for (si = 0; si < pay_len; si++)
-		crc += aud_bounce[si];
-
-	aud_inject_hdr[0] = 'A';
-	aud_inject_hdr[1] = 'V';
-	aud_inject_hdr[2] = aud_frame_seq++;
-	aud_inject_hdr[3] = (unsigned char)(pay_len & 0xFF);
-	aud_inject_hdr[4] = (unsigned char)(pay_len >> 8);
-	aud_inject_hdr[5] = crc;
-	total = AUD_HDR_LEN + pay_len;
-
-	/* Encoder en 2 bits/pixel dans les dernières lignes Y. */
-	ybase = nv12 + (size_t)(H - AUD_ROWS) * W;
-	di = 0;
-	for (row = 0; row < AUD_ROWS; row++) {
-		unsigned char *line = ybase + (size_t)row * W;
-
-		for (col = 0; col < W && di < total; col += 4) {
-			unsigned char sym[4];
-			unsigned char b;
-
-			b = (di < AUD_HDR_LEN) ? aud_inject_hdr[di]
-					       : aud_bounce[di - AUD_HDR_LEN];
-			sym[0] = (b >> 6) & 3;
-			sym[1] = (b >> 4) & 3;
-			sym[2] = (b >> 2) & 3;
-			sym[3] = b & 3;
-			di++;
-			line[col + 0] =
-				(unsigned char)(25 + sym[0] * 70);
-			line[col + 1] =
-				(unsigned char)(25 + sym[1] * 70);
-			line[col + 2] =
-				(unsigned char)(25 + sym[2] * 70);
-			line[col + 3] =
-				(unsigned char)(25 + sym[3] * 70);
-		}
-	}
-
-	/* BALISE DE FIN (build 87) : 'T','S','E','L' + len_lo,len_hi,crc
-	 * APRÈS les données. Le PC s'ancre sur TSEL et lit les N octets
-	 * d'avant : insensible à tout décalage de fenêtre. */
-	{
-		static const unsigned char tail[4] = { 'T', 'S', 'E', 'L' };
-		unsigned char meta[3];
-		unsigned int base = total * 4;
-		unsigned int j;
-
-		meta[0] = (unsigned char)(pay_len & 0xFF);
-		meta[1] = (unsigned char)(pay_len >> 8);
-		meta[2] = crc;
-
-		if (base + 28 <= (unsigned int)(AUD_ROWS * W)) {
-			for (j = 0; j < 4; j++) {
-				unsigned char tb = tail[j];
-
-				ybase[base + j * 4 + 0] =
-				  (unsigned char)(25 + ((tb >> 6) & 3) * 70);
-				ybase[base + j * 4 + 1] =
-				  (unsigned char)(25 + ((tb >> 4) & 3) * 70);
-				ybase[base + j * 4 + 2] =
-				  (unsigned char)(25 + ((tb >> 2) & 3) * 70);
-				ybase[base + j * 4 + 3] =
-				  (unsigned char)(25 + (tb & 3) * 70);
-			}
-			base += 16;
-			for (j = 0; j < 3; j++) {
-				unsigned char mb = meta[j];
-
-				ybase[base + j * 4 + 0] =
-				  (unsigned char)(25 + ((mb >> 6) & 3) * 70);
-				ybase[base + j * 4 + 1] =
-				  (unsigned char)(25 + ((mb >> 4) & 3) * 70);
-				ybase[base + j * 4 + 2] =
-				  (unsigned char)(25 + ((mb >> 2) & 3) * 70);
-				ybase[base + j * 4 + 3] =
-				  (unsigned char)(25 + (mb & 3) * 70);
-			}
-		}
-	}
-
-	/* NEUTRALISER LA CHROMA des mêmes lignes : sans ça, U/V issus
-	 * de l'image du jeu teintent nos gris et le canal G côté PC
-	 * ne reflète plus les symboles (magies AV/s=0, build 81).
-	 * 8 lignes Y → 4 lignes UV à U=V=128, juste après le plan Y
-	 * en mémoire (NV12) → zone contiguë avec nos lignes. */
-	{
-		unsigned char *uv = nv12 + (size_t)W * H +
-				    (size_t)((H - AUD_ROWS) / 2) * W;
-		unsigned int n = (AUD_ROWS / 2) * W;
-
-		for (si = 0; si < n; si++)
-			uv[si] = 128;
-	}
-}
-#endif /* ENABLE_AUDIO_CAPTURE */
 static volatile unsigned char touch_edge_history;
 static volatile unsigned char last_read_count;
 static volatile unsigned int rx_sequence;
@@ -756,289 +427,6 @@ static int sceTouchRead2_patched(int port, SceTouchData *data, int count)
 	patch_touch_data(port, data, count);
 	return ret;
 }
-
-#if ENABLE_AUDIO_CAPTURE
-/* ---- Audio redirection implementation ---- */
-static int audio_send_pkt(unsigned char *pkt)
-{
-	static SceUdcdDeviceRequest req;
-
-	req = (SceUdcdDeviceRequest){
-		.endpoint = &endpoints[2],
-		.data = pkt,
-		.attributes = 0,
-		.size = 64,
-		.isControlRequest = 0,
-		.onComplete = NULL,
-		.transmitted = 0,
-		.returnCode = 0,
-		.next = NULL,
-		.unused = NULL,
-		.physicalAddress = NULL
-	};
-
-	ksceKernelDcacheCleanRange(pkt, 64);
-	return ksceUdcdReqSend(&req);
-}
-
-static int audio_ring_push(const short *samples, int nFrames, int ch, int dec,
-			    int buf_shorts)
-{
-	int i, k;
-	unsigned int written = 0;
-	int max_iter;
-
-	if (aring_mutex < 0)
-		return 0; /* mutex pas prêt : on saute ce morceau */
-
-	ksceKernelLockMutex(aring_mutex, 0, NULL);
-
-	/* Place disponible (en échantillons de 2 octets), plafonnée au
-	 * nombre de frames décimées réellement présentes. */
-	max_iter = (int)((ARING_SIZE - 2 - (ar_head - ar_tail)) / 2);
-	if (nFrames / dec < max_iter)
-		max_iter = nFrames / dec;
-
-	for (i = 0; i < max_iter; i++) {
-		int acc = 0;
-		unsigned h;
-		int idx = i * dec * ch;
-
-		/* GARDE ANTI-CRASH : si la config devinée (ch) dépasse
-		 * la taille réelle du buffer du jeu (port mono lu comme
-		 * stéréo…), STOP net — jamais de lecture hors allocation. */
-		if (idx + ch > buf_shorts)
-			break;
-
-		for (k = 0; k < ch; k++)
-			acc += samples[(long)idx + k];
-		acc /= ch;
-
-		h = ar_head & ARING_MASK;
-		aring[h] = (unsigned char)(acc & 0xFF);
-		aring[(h + 1) & ARING_MASK] = (unsigned char)((acc >> 8) & 0xFF);
-		ar_head += 2;
-		written += 2;
-	}
-
-	ksceKernelUnlockMutex(aring_mutex, 0);
-
-	/* Diag fin : la boucle a-t-elle tourné au moins une fois ?
-	 * 6 = rien à décimer (nFrames<dec → paramètres absurdes)
-	 * 7 = ring plein dès le premier échantillon */
-	if (written == 0)
-		aud_diag = (nFrames / dec < 1) ? 6 : 7;
-	else
-		aud_diag = 5; /* lecture OK confirmée jusqu'au ring */
-
-	return (int)written;
-}
-
-static int sceAudioOutOutput_patched(int port, const void *pBuffer)
-{
-	int r;
-
-#if ENABLE_AUDIO_PIDGRAB
-	/* Point de capture PID additionnel : ce hook tourne dans le thread
-	 * du processus qui joue du son (= le jeu en pratique). Couvre les
-	 * jeux qui ne pollent jamais le tactile. */
-	if (pc_control_active)
-		game_pid = ksceKernelGetProcessId();
-#endif
-
-	/* L'original JOUE D'ABORD : son code retour est notre validateur
-	 * (r >= 0 = bloc joué, donc contenu lisible). Signature 2 args :
-	 * la taille du bloc est le granule du port, appris à l'OpenPort. */
-	r = TOUCH_CALL_OLD(audio_out_ref, audio_out_fn_t, port, pBuffer);
-
-#if ENABLE_AUDIO_BISECT_PASSTHRU
-	/* BISECTION : hook présent mais corps vide. Si ça crash encore
-	 * → le problème est l'INSTALLATION/PRÉSENCE du hook lui-même
-	 * (conflit chaîne taiHEN avec un autre plugin). Si ça passe →
-	 * notre logique est en cause et on la réintroduit morceau par
-	 * morceau. */
-	return r;
-#endif
-
-#if ENABLE_AUDIO_PUSH
-	if (audio_capture_on && !pBuffer) {
-		aud_diag = 8; /* appel bloquant de synchro : normal */
-		if (n_null_calls < 255)
-			n_null_calls++;
-	}
-	else if (audio_capture_on && r < 0)
-		aud_diag = 9;
-
-	if (audio_capture_on && r >= 0 && pBuffer && port >= 0) {
-		/* Chemin chaud conforme EQVita : zéro syscall coûteux,
-		 * aucune allocation. Ports sparses (0x100 BGM…) inclus.
-		 *
-		 * GRANULE PAR TIMING : en lecture synchrone, l'écart
-		 * entre deux appels réels ≈ durée du buffer. On déduit
-		 * les frames puis on ARRONDI VERS LE BAS par multiples
-		 * de 64 → lecture toujours ≤ allocation = zéro crash
-		 * possible, même si l'estimation dépasse un poil. */
-		struct aport_state *ps;
-		int nf, dec;
-		SceUID cur_pid = ksceKernelGetProcessId();
-		unsigned char my_pid = (unsigned char)(cur_pid & 0xFF);
-
-		n_real_calls++;
-		aud_diag_port = (unsigned char)(port & 0xFF);
-		ps = aport_get(port, my_pid);
-		if (!ps) {
-			return r;
-		}
-
-		/* GRANULE : uniquement depuis le registre (appris par les
-		 * hooks OpenPort/SetConfig/GetConfig installés AU BOOT —
-		 * ils précèdent toute ouverture de port de jeu).
-		 * INTERDIT d'interroger le driver ici : on est DÉJÀ
-		 * dans SceAudio (ré-entrée = verrous = panic). Granule
-		 * inconnu → bypass silencieux, règle EQVita. */
-		if (!ps->granule)
-			return r;
-
-		/* ANTI-CRASH STRUCTUREL (leçon des builds 65-72) : on ne
-		 * lit pBuffer QUE si la config du port vient de NOS
-		 * hooks OpenPort/SetConfig. Une entrée par défaut LRU
-		 * (ch/granule inventés) décrirait mal l'allocation
-		 * réelle du port système → lecture hors buffer → data
-		 * abort dès qu'un son UI joue. */
-		if (!ps->learned || ps->granule <= 0)
-			return r;
-		if (ps->ch != 1 && ps->ch != 2)
-			return r;
-		if (ps->fr < 8000 || ps->fr > 192000)
-			return r;
-
-		nf = ps->granule;
-		dec = ps->fr / 24000;
-		if (dec < 1)
-			dec = 1;
-
-		/* PUBLICATION DIRECTE dans le double-buffer vidéo :
-		 * ZÉRO ring, ZÉRO mutex. Producteur unique (ce hook,
-		 * un seul thread audio actif à la fois), consommateur
-		 * unique (thread vidéo). Cohérence par séquence, et
-		 * tout chunk déchiré est rejeté par le CRC côté PC.
-		 * Décimation vers 24 kHz mono faite ici, hot-path
-		 * borné et sans allocation (règle EQVita). */
-		{
-			unsigned int idx = (aud_stage_seq + 1) & 1;
-			unsigned char *out = aud_stage[idx] + AUD_HDR_LEN;
-			unsigned int cap = AUD_PAYLOAD_CAP;
-			const short *in;
-			unsigned int o = 0, i, nf_safe, copy_len;
-			int cp;
-
-			/* LECTURE PROTÉGÉE (leçon 74-77) : pBuffer peut
-			 * être une VA du processus appelant non mappée
-			 * dans notre contexte de lecture (sons UI joués
-			 * via des workers kernel) → tout déréférencement
-			 * direct = data abort. ksceKernelCopyFromUser-
-			 * Proc est CONÇUE pour ça : elle renvoie une
-			 * erreur au lieu de paniquer. */
-			nf_safe = ((unsigned)nf > 2048) ? 2048 : (unsigned)nf;
-			copy_len = nf_safe * 2;
-			/* ATTENTION : le SceUID COMPLET ici — le pid
-			 * tronqué &0xFF n'est qu'une clé de table, pas
-			 * un handle valide (cause pub=0 du build 79). */
-			cp = ksceKernelCopyFromUserProc(
-				cur_pid, aud_bounce, pBuffer,
-				(SceSize)copy_len);
-			if (cp < 0)
-				return r; /* mapping absent : chunk sauté */
-
-			in = (const short *)aud_bounce;
-			for (i = 0; i < nf_safe && o + 2 <= cap;
-			     i += dec) {
-				int acc = in[i];
-				out[o++] = (unsigned char)(acc & 0xFF);
-				out[o++] = (unsigned char)((acc >> 8) & 0xFF);
-			}
-			if (o > 0) {
-				aud_stage_len[idx] = o;
-				aud_stage_seq++; /* publication */
-				n_push_ok++;
-				if (n_pub_chunks < 255)
-					n_pub_chunks++;
-			}
-		}
-
-#if ENABLE_AUDIO_MUTE
-		/* Mute the console: the PC is the speaker now. */
-		memset((void *)pBuffer, 0, (size_t)nf * 2 * ps->ch);
-#endif
-	}
-#endif /* ENABLE_AUDIO_PUSH */
-
-	return r;
-}
-
-static int sceAudioOutOpenPort_patched(int type, int len, int freq, int mode)
-{
-	int ret = TOUCH_CALL_OLD(audio_open_ref, audio_open_fn_t, type, len, freq, mode);
-	if (ret >= 0) {
-		aport_set_params(ret, (mode == 1) ? 2 : 1, freq, len,
-				 (unsigned char)(ksceKernelGetProcessId() & 0xFF));
-		audio_mod_found = 1;
-	}
-	return ret;
-}
-
-static int sceAudioOutSetConfig_patched(int port, unsigned int len, int freq, int mode)
-{
-	int ret = TOUCH_CALL_OLD(audio_setcfg_ref, audio_setcfg_fn_t, port, (unsigned int)len, freq, mode);
-	if (ret >= 0 && port >= 0) {
-		aport_set_params(port, (mode == 1) ? 2 : 1, freq, (int)len,
-				 (unsigned char)(ksceKernelGetProcessId() & 0xFF));
-		audio_mod_found = 1;
-	}
-	return ret;
-}
-
-/* ---- GetConfig : la source de vérité du DRIVER ----
- * (déclarations en tête de fichier ; le patch vit ici). */
-void aport_learn_from_driver(int port);
-
-static int sceAudioOutGetConfig_patched(int port, int type)
-{
-	int r = TOUCH_CALL_OLD(audio_getcfg_ref, audio_getcfg_fn_t, port, type);
-	if (r > 0 && port >= 0) {
-		struct aport_state *ps = aport_get(port,
-			(unsigned char)(ksceKernelGetProcessId() & 0xFF));
-		if (ps && ps->learned) {
-			switch (type) {
-			case 0: /* LEN = granule */
-				if (r <= 16384)
-					ps->granule = r;
-				break;
-			case 1: /* FREQ */
-				if (r >= 8000 && r <= 192000)
-					ps->fr = r;
-				break;
-			case 2: /* MODE : 0=mono 1=stereo */
-				if (r == 0 || r == 1)
-					ps->ch = (r == 1) ? 2 : 1;
-				break;
-			}
-		}
-	}
-	return r;
-}
-
-void aport_learn_from_driver(int port)
-{
-	if (audio_getcfg_uid <= 0 || port < 0)
-		return;
-	/* Trois requêtes directes ; les réponses passent par le patch
-	 * ci-dessus qui remplit le registre. */
-	sceAudioOutGetConfig_patched(port, 0);
-	sceAudioOutGetConfig_patched(port, 1);
-	sceAudioOutGetConfig_patched(port, 2);
-}
-#endif /* ENABLE_AUDIO_CAPTURE */
 
 /* Install/remove the six SceTouch interceptors. Removal fully restores
  * the stock touchscreen (hooks released, not just neutralized). */
@@ -1343,10 +731,9 @@ static int pc_hid_start_receive(void)
 	return ksceUdcdReqRecv(&pc_hid_recv_req);
 }
 
-/* ---- Canal EP2 (rentrant) : UNE SEULE requ�te � la fois ----
- * Le battement de c�ur ET l'audio partagent cet endpoint ; le pilote
- * UDCD ne tol�re pas les requ�tes imbriqu�es sur le m�me endpoint
- * (source du panic au lancement d'un jeu). */
+/* ---- EP2 (HID IN): one request at a time ----
+ * The heartbeat is sent here. UDCD does not tolerate nested requests on
+ * the same endpoint (that caused a panic when a game started). */
 static unsigned char ep2_pkt[64] __attribute__((aligned(64)));
 static SceUdcdDeviceRequest ep2_req;
 static volatile int ep2_busy;
@@ -1360,11 +747,8 @@ static void ep2_on_complete(SceUdcdDeviceRequest *req)
 /* Copie pkt puis envoie ; -1 si le canal est encore occup�. */
 static int ep2_try_send(const unsigned char *pkt)
 {
-	/* Thread-safe test-and-set : le heartbeat tourne dans uvc_thread
-	 * et l'audio dans son propre worker. Un simple � if (ep2_busy) �
-	 * laisserait deux threads franchir la barri�re simultan�ment
-	 * (requ�tes imbriqu�es sur EP2 = panique UDCD). Le CAS rend
-	 * l'acquisition atomique ; seul le gagnant touche ep2_req/ep2_pkt. */
+	/* Atomic test-and-set: only the winner touches ep2_req/ep2_pkt, so two
+	 * callers can never put nested requests on EP2. */
 	int old = __sync_val_compare_and_swap(&ep2_busy, 0, 1);
 	if (old != 0)
 		return -1;
@@ -1431,7 +815,7 @@ static void pc_hid_send_input_heartbeat(void)
 	hb[16] = pad.ry;
 	hb[17] = (unsigned char)pc_ret_button_emu;
 	hb[18] = (unsigned char)pc_ret_analog_emu;
-	hb[19] = aud_diag_port; /* dernier port audio réel vu par le hook */
+	audio_heartbeat(&hb[19], &hb[60], &hb[62]); /* audio state, packets/4, errors */
 	hb[20] = ++seq;
 
 	/* Video-side ground truth: is the UVC stream active and what did
@@ -1491,80 +875,19 @@ static void pc_hid_send_input_heartbeat(void)
 	hb[55] = (unsigned char)((rx_sequence >> 8) & 0xFF);
 	hb[56] = (unsigned char)((rx_sequence >> 16) & 0xFF);
 	hb[57] = (unsigned char)((rx_sequence >> 24) & 0xFF);
-	/* Sondes pipeline (seul octet libre : hb[9]) :
-	 * haut = chunks publiés par hook, bas = frames encodées vidéo */
-	hb[9] = (unsigned char)(((n_pub_chunks > 15 ? 15 : n_pub_chunks) << 4) |
-				(n_enc_frames > 15 ? 15 : n_enc_frames));
 	/* Exit-game diagnostics: PID of the latest touch poller (2 bytes,
 	 * les PIDs tiennent largement dans 16 bits) + kill state. */
 	hb[58] = (unsigned char)((unsigned int)game_pid & 0xFF);
-	hb[59] = (unsigned char)((((unsigned int)game_pid >> 8) & 0x0F) |
-	                         ((aud_diag & 0x0F) << 4));
-#if ENABLE_AUDIO_CAPTURE
-	{
-		/* Sonde granule (bits 3-7 de hb[60]) :
-		 * 0 = jamais appris | 1-31 = (granule/64)+1 */
-		int gprobe = 0, kk;
-		for (kk = 0; kk < APORT_MAX; kk++) {
-			if (aport_tab[kk].port == 7 &&
-			    aport_tab[kk].granule > 0) {
-				gprobe = ((aport_tab[kk].granule >> 6) + 1);
-				if (gprobe > 31) gprobe = 31;
-				break;
-			}
-		}
-		hb[60] = (unsigned char)((audio_out_hook_uid > 0 ? 1 : 0) |
-				(audio_capture_on ? 2 : 0) |
-				(audio_mod_found ? 4 : 0) |
-				(gprobe << 3));
-	}
-#else
-	hb[60] = 0;
-#endif
+	hb[59] = (unsigned char)(((unsigned int)game_pid >> 8) & 0x0F);
 	hb[61] = (unsigned char)((exit_game_request ? 8 : 0) |
 	                         ((kill_result & 3) << 4) |
 	                         ((exit_phase & 3) << 6));
-	/* hb[62] : haut = appels réels (buffer non NULL) / fenêtre 500ms,
-	 *          bas  = paquets EP2 envoyés / fenêtre.
-	 * Décisif : distingue « le jeu ne soumet rien »
-	 * de « on n'arrive pas à l'envoyer ». */
-	hb[62] = (unsigned char)(((n_real_calls & 0x0F) << 4) |
-				 (usb_audio_ok_cnt & 0x0F));
-	/* NULLs (appels bloquants) dans le quartet haut de hb[46] */
-	hb[46] = (unsigned char)((hb[46] & 0x0F) |
-		 ((n_null_calls > 15 ? 15 : n_null_calls) << 4));
-	hb[63] = 95; /* build id: 90 PS, 91 all inputs, 95 = 91 + debug breadcrumbs (TODO.md) */
+	hb[63] = 96; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio */
 
 	ep2_try_send(hb);
-	usb_audio_ok_cnt = 0;
-	n_real_calls = 0;
-	n_push_ok = 0;
-	n_null_calls = 0;
-	n_pub_chunks = 0;
-	n_enc_frames = 0;
 	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;
 	touch_patched_reads[SCE_TOUCH_PORT_BACK] = 0;
 }
-
-/* ---- Worker audio d�di� ----
- * Boucle ind�pendante : un paquet 62 octets toutes les 2 ms tant que
- * la capture est active et le ring aliment�. Ne partage RIEN avec
- * uvc_thread hormis ep2_try_send() (rendu atomique par CAS). */
-static int audio_send_thread(SceSize args, void *argp)
-{
-	(void)args; (void)argp;
-
-	while (audio_thread_run) {
-		int k_port;
-		(void)k_port;
-		/* Ring supprimé du chemin des données (build 71) : le
-		 * hook publie directement dans le double-buffer vidéo.
-		 * Ce worker ne sert plus qu'à respirer. */
-		ksceKernelDelayThreadCB(20000);
-	}
-	return 0;
-}
-
 
 static int uvc_frame_init(unsigned int size);
 static int uvc_frame_term();
@@ -1812,6 +1135,8 @@ static void uvc_handle_set_interface(const SceUdcdEP0DeviceRequest *req)
 {
 	if ((req->wIndex == STREAM_INTERFACE) && (req->wValue == 0))
 		uvc_handle_video_abort();
+	if (req->wIndex == AUDIO_STREAM_INTERFACE)
+		audio_set_streaming(req->wValue == 1);
 }
 
 static void uvc_handle_clear_feature(const SceUdcdEP0DeviceRequest *req)
@@ -1952,6 +1277,11 @@ static int uvc_udcd_process_request(int recipient, int arg, SceUdcdEP0DeviceRequ
 
 static int uvc_udcd_change_setting(int interfaceNumber, int alternateSetting, int bus)
 {
+	/* The PC opens (alternate 1) or closes (alternate 0) the audio device.
+	 * Also seen as SET_INTERFACE in uvc_handle_set_interface; both are
+	 * harmless together. */
+	if (interfaceNumber == AUDIO_STREAM_INTERFACE)
+		audio_set_streaming(alternateSetting == 1);
 	return 0;
 }
 
@@ -1999,6 +1329,7 @@ static void uvc_udcd_detach(void *user_data)
 	dbg_detach_n++;
 #endif
 	BC(bc_detach_step, 1);
+	audio_set_streaming(0);
 	uvc_handle_video_abort();
 	BC(bc_detach_step, 2);
 	ksceUdcdReqCancelAll(&endpoints[3]);
@@ -2047,7 +1378,7 @@ static int uvc_driver_stop(int size, void *p, void *user_data)
 
 static SceUdcdDriver uvc_udcd_driver = {
 	.driverName			= UVC_DRIVER_NAME,
-	.numEndpoints			= 4,
+	.numEndpoints			= 5,
 	.endpoints			= endpoints,
 	.interface			= &interface,
 	.descriptor_hi			= &devdesc_hi,
@@ -2198,33 +1529,10 @@ static int convert_and_send_frame_nv12(int fid, const SceDisplayFrameBufInfo *fb
 	if (ret < 0)
 		return ret;
 
-	/* IFTU est ASYNCHRONE : sa DMA finit d'écrire le buffer APRÈS
-	 * le retour de l'appel. Sans attente, elle écrase nos lignes
-	 * audio → l'USB n'envoie que l'image (symptôme exact du build
-	 * 80 : enc=15+, magies AV/s=0). Le crash historique attribué
-	 * au délai venait en réalité du mutex dans ce même chemin,
-	 * supprimé depuis. */
+	/* IFTU is asynchronous: its DMA finishes writing the buffer after the
+	 * call returns. Wait before USB sends the frame. (Kept from the build
+	 * that embedded audio in the frames; untested without it.) */
 	ksceKernelDelayThreadCB(2000);
-
-	/* Audio embarqué : écriture CPU puis CLEAN (writeback vers RAM
-	 * pour que le DMA USB voie l'audio), borné aux 8 lignes avec
-	 * alignement ligne de cache 32 o. */
-#if ENABLE_AUDIO_INJECT
-	if (audio_capture_on && uvc_frame_buffer_uid >= 0
-	    && uvc_frame_buffer_addr && uvc_frame_buffer_addr->data) {
-		uintptr_t s, e;
-		unsigned char *d = uvc_frame_buffer_addr->data;
-
-		inject_audio_rows(d, dst_width, dst_height);
-		s = (uintptr_t)(d +
-		    (size_t)(dst_height - AUD_ROWS) * dst_width);
-		e = s + (AUD_ROWS + AUD_ROWS / 2) * dst_width;
-		s &= ~(uintptr_t)0x1F;
-		e = (e + 0x1F) & ~(uintptr_t)0x1F;
-		ksceKernelDcacheCleanRange((void *)s,
-					   (unsigned int)(e - s));
-	}
-#endif
 
 	ret = uvc_frame_transfer(uvc_frame_buffer_addr,
 				 UVC_PAYLOAD_SIZE(VIDEO_FRAME_SIZE_NV12(dst_width, dst_height)),
@@ -2422,8 +1730,6 @@ static int uvc_thread(SceSize args, void *argp)
 	SceUInt64 last_hb = ksceKernelGetSystemTimeWide();
 	unsigned int seen_rx = rx_sequence;
 	SceUInt64 last_rx_change = last_hb;
-	SceUInt64 next_audio_try = 0;
-	unsigned int audio_tries = 0;
 	SceUInt64 next_power_tick = 0;
 
 	while (uvc_thread_run) {
@@ -2459,19 +1765,6 @@ static int uvc_thread(SceSize args, void *argp)
 			touch_hooks_install();
 			touch_hooks_wanted = 0;
 		}
-
-		/* NB : le drain audio NE VIT PLUS ICI. Il tourne dans
-		 * audio_send_thread (worker d�di�, cf. plus haut) � ce
-		 * thread ne se r�veille qu'au rythme vid�o (~30 Hz),
-		 * bien trop lent pour l'audio, et son contexte li� au
-		 * callback vblank �tait la source des panics UDCD. */
-
-		/* Hooks audio : installés DANS module_start (au boot),
-		 * comme EQVita — ainsi ils précèdent l'ouverture des
-		 * ports par les jeux et les enregistreurs OpenPort ne
-		 * ratent JAMAIS un granule. L'installation tardive ici
-		 * faisait rater l'OpenPort de Rayman → granule inconnu
-		 * à jamais → silence. */
 
 		if (now - last_hb >= 500000) { /* heartbeat every ~500 ms */
 			last_hb = now;
@@ -2531,17 +1824,10 @@ static int uvc_thread(SceSize args, void *argp)
 		if (rx_sequence != seen_rx) {
 			seen_rx = rx_sequence;
 			last_rx_change = now;
-#if ENABLE_AUDIO_CAPTURE
-			if (audio_out_hook_uid > 0 && aring)
-				audio_capture_on = 1;
-#endif
 		} else if (pc_control_active && now - last_rx_change > 1000000ULL) {
 			pc_control_release();
 			pc_touch_release_all();
 			touch_hooks_wanted = 0;
-#if ENABLE_AUDIO_CAPTURE
-			audio_capture_on = 0;
-#endif
 			/* Une s�quence exit � moiti� faite ne doit pas tirer
 			 * sur une session morte. */
 			exit_phase = 0;
@@ -2969,34 +2255,6 @@ int module_start(SceSize argc, const void *args)
 	     touch_read_hook_uid, touch_read_region_hook_uid,
 	     touch_peek2_hook_uid, touch_read2_hook_uid);
 
-#if ENABLE_AUDIO_CAPTURE && ENABLE_AUDIO_HOOKTRY
-	/* Hooks audio AU BOOT (architecture EQVita) : SceAudio est déjà
-	 * chargé par boot_config quand taiHEN lance les plugins, donc
-	 * l'accroche ici est sûre — et surtout elle PRÉCÈDE toute
-	 * ouverture de port par les jeux : OpenPort/SetConfig ne
-	 * ratent plus jamais le granule. */
-	audio_out_hook_uid = taiHookFunctionExportForKernel(
-		KERNEL_PID, &audio_out_ref, "SceAudio",
-		TAI_ANY_LIBRARY, 0x02DB3F5F,
-		sceAudioOutOutput_patched);
-	if (audio_out_hook_uid <= 0)
-		audio_out_hook_uid = -1;
-#if ENABLE_AUDIO_RECORDERS
-	audio_open_uid = taiHookFunctionExportForKernel(
-		KERNEL_PID, &audio_open_ref, "SceAudio",
-		TAI_ANY_LIBRARY, 0x5BC341E4,
-		sceAudioOutOpenPort_patched);
-	audio_setcfg_uid = taiHookFunctionExportForKernel(
-		KERNEL_PID, &audio_setcfg_ref, "SceAudio",
-		TAI_ANY_LIBRARY, 0xB8BA0D07,
-		sceAudioOutSetConfig_patched);
-	audio_getcfg_uid = taiHookFunctionExportForKernel(
-		KERNEL_PID, &audio_getcfg_ref, "SceAudio",
-		TAI_ANY_LIBRARY, 0x9C8EDAEA,
-		sceAudioOutGetConfig_patched);
-#endif
-#endif
-
 	uvc_thread_id = DCALL(ksceKernelCreateThread("uvc_thread", uvc_thread,
 					       0x3C, 0x1000, 0, 0x10000, 0));
 	if (uvc_thread_id < 0) {
@@ -3016,23 +2274,8 @@ int module_start(SceSize argc, const void *args)
 
 	uvc_thread_run = 1;
 
-	/* Worker audio d�di� : son �chec ne doit pas emp�cher le
-	 * chargement du module (la vid�o/tactile continuent sans lui). */
-	aring_mutex = DCALL(ksceKernelCreateMutex("aring_mut", 0, 0, NULL));
-	if (aring_mutex < 0) {
-		DFLUSH();
-		return SCE_KERNEL_START_FAILED;
-	}
-
-	audio_thread_run = 1;
-	audio_thread_id = DCALL(ksceKernelCreateThread("aud_send",
-						 audio_send_thread,
-						 0x3C, 0x1000, 0,
-						 0x10000, 0));
-	if (audio_thread_id >= 0)
-		ksceKernelStartThread(audio_thread_id, 0, NULL);
-	else
-		audio_thread_id = -1;
+	/* USB audio (Vita sound to the PC): optional, the rest works without. */
+	ret = DCALL(audio_init(&endpoints[4]));
 
 	/* Last line before uvc_thread runs: from here on only that thread
 	 * writes to the log buffer. */
@@ -3070,21 +2313,12 @@ int module_stop(SceSize argc, const void *args)
 	pc_control_release();
 	ksceUdcdReqCancelAll(&endpoints[3]);
 	uvc_thread_run = 0;
-	audio_thread_run = 0;
+	audio_set_streaming(0);
 
 	ksceKernelSetEventFlag(uvc_event_flag_id, 1);
 	ksceKernelWaitThreadEnd(uvc_thread_id, NULL, NULL);
 
-	if (audio_thread_id >= 0) {
-		ksceKernelWaitThreadEnd(audio_thread_id, NULL, NULL);
-		ksceKernelDeleteThread(audio_thread_id);
-		audio_thread_id = -1;
-	}
-
-	if (aring_mutex >= 0) {
-		ksceKernelDeleteMutex(aring_mutex);
-		aring_mutex = -1;
-	}
+	audio_fini();
 
 	ksceKernelDeleteEventFlag(uvc_event_flag_id);
 	ksceKernelDeleteThread(uvc_thread_id);

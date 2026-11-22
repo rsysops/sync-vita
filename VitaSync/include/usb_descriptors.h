@@ -1,4 +1,5 @@
 ﻿#include "uvc.h"
+#include "uac.h"
 
 #ifndef HID_DESCRIPTOR_HID
 #define HID_DESCRIPTOR_HID 0x21
@@ -263,13 +264,92 @@ static unsigned char hiddesc[] = {
 	(sizeof(hid_report_descriptor) >> 8) & 0xFF
 };
 
+/*
+ * Audio capture function (USB Audio Class 1.0): the Vita's sound to the PC.
+ * Interface 3 = AudioControl, interface 4 = AudioStreaming (alternate 0 idle,
+ * alternate 1 streaming on an isochronous IN endpoint).
+ */
+#define AUDIO_CONTROL_INTERFACE	3
+#define AUDIO_STREAM_INTERFACE	4
+#define AUDIO_EP_IN		4
+#define AUDIO_IT_ID		1	/* input terminal: the Vita's output mix */
+#define AUDIO_OT_ID		2	/* output terminal: USB streaming */
+
+/* SceUdcd writes the configuration's extra block (the video IAD) once, after
+ * the configuration descriptor. This IAD therefore rides on the extra block
+ * of the endpoint written just before interface 3 (the HID OUT endpoint). */
+static unsigned char audio_iad[] = {
+	0x08, UAC_IAD_DESCRIPTOR_TYPE,
+	AUDIO_CONTROL_INTERFACE,	/* bFirstInterface */
+	0x02,				/* bInterfaceCount */
+	USB_CLASS_AUDIO, 0x00, 0x00,	/* class, subclass, protocol */
+	0x00,				/* iFunction */
+};
+
+static unsigned char audio_control_cs[] = {
+	/* header */
+	0x09, UAC_CS_INTERFACE, UAC_AC_HEADER,
+	0x00, 0x01,			/* bcdADC 1.00 */
+	30, 0x00,			/* wTotalLength: these three descriptors */
+	0x01, AUDIO_STREAM_INTERFACE,	/* one streaming interface */
+	/* input terminal: a stereo line, the Vita's mix */
+	0x0C, UAC_CS_INTERFACE, UAC_AC_INPUT_TERMINAL,
+	AUDIO_IT_ID,
+	UAC_TERMINAL_LINE_CONNECTOR & 0xFF, UAC_TERMINAL_LINE_CONNECTOR >> 8,
+	0x00,				/* bAssocTerminal */
+	UAC_CHANNELS,
+	0x03, 0x00,			/* left front, right front */
+	0x00, 0x00,			/* iChannelNames, iTerminal */
+	/* output terminal: USB streaming */
+	0x09, UAC_CS_INTERFACE, UAC_AC_OUTPUT_TERMINAL,
+	AUDIO_OT_ID,
+	UAC_TERMINAL_USB_STREAMING & 0xFF, UAC_TERMINAL_USB_STREAMING >> 8,
+	0x00,				/* bAssocTerminal */
+	AUDIO_IT_ID,			/* bSourceID */
+	0x00,				/* iTerminal */
+};
+
+static unsigned char audio_stream_cs[] = {
+	/* general */
+	0x07, UAC_CS_INTERFACE, UAC_AS_GENERAL,
+	AUDIO_OT_ID,			/* bTerminalLink */
+	0x01,				/* bDelay (frames) */
+	UAC_FORMAT_PCM & 0xFF, UAC_FORMAT_PCM >> 8,
+	/* format type I: stereo, 16-bit, one rate */
+	0x0B, UAC_CS_INTERFACE, UAC_AS_FORMAT_TYPE,
+	UAC_FORMAT_TYPE_I,
+	UAC_CHANNELS, UAC_SAMPLE_BYTES, 16,
+	0x01,				/* bSamFreqType: one discrete rate */
+	UAC_RATE & 0xFF, (UAC_RATE >> 8) & 0xFF, (UAC_RATE >> 16) & 0xFF,
+};
+
+/* SceUdcd writes a 7-byte standard endpoint descriptor, then this block: its
+ * first two bytes finish the 9-byte UAC endpoint descriptor (bRefresh,
+ * bSynchAddress), the rest is the class-specific endpoint descriptor. */
+static unsigned char audio_ep_extra[] = {
+	0x00, 0x00,
+	0x07, UAC_CS_ENDPOINT, UAC_EP_GENERAL,
+	0x00,				/* bmAttributes: no controls */
+	0x00, 0x00, 0x00,		/* bLockDelayUnits, wLockDelay */
+};
+
+_Static_assert(sizeof(audio_iad) == 8, "audio IAD size");
+_Static_assert(sizeof(audio_control_cs) == 30, "AudioControl descriptors size");
+_Static_assert(sizeof(audio_stream_cs) == 18, "AudioStreaming descriptors size");
+_Static_assert(sizeof(audio_ep_extra) == 9, "audio endpoint extra size");
+
+#define AUDIO_DESC_BYTES	(3 * USB_DT_INTERFACE_SIZE + USB_DT_ENDPOINT_SIZE + \
+				 sizeof(audio_iad) + sizeof(audio_control_cs) + \
+				 sizeof(audio_stream_cs) + sizeof(audio_ep_extra))
+
 /* Endpoint blocks */
 static
-struct SceUdcdEndpoint endpoints[4] = {
+struct SceUdcdEndpoint endpoints[5] = {
 	{USB_ENDPOINT_OUT, 0, 0, 0},
 	{USB_ENDPOINT_IN, 1, 0, 0},
 	{USB_ENDPOINT_IN, 2, 0, 0},
 	{USB_ENDPOINT_OUT, 3, 0, 0},
+	{USB_ENDPOINT_IN, AUDIO_EP_IN, 0, 0},
 };
 
 /* Interface */
@@ -277,7 +357,7 @@ static
 struct SceUdcdInterface interface = {
 	.expectNumber		= -1,
 	.interfaceNumber	= 0,
-	.numInterfaces		= 3
+	.numInterfaces		= 5
 };
 
 /* String descriptors */
@@ -316,7 +396,7 @@ struct SceUdcdDeviceDescriptor devdesc_hi = {
 
 /* Hi-Speed endpoint descriptors */
 static
-struct SceUdcdEndpointDescriptor endpdesc_hi[4] = {
+struct SceUdcdEndpointDescriptor endpdesc_hi[5] = {
 	/* Video Streaming endpoint */
 	{
 		USB_DT_ENDPOINT_SIZE, USB_DT_ENDPOINT,
@@ -330,14 +410,21 @@ struct SceUdcdEndpointDescriptor endpdesc_hi[4] = {
 	/* HID output endpoint */
 	{
 		USB_DT_ENDPOINT_SIZE, USB_DT_ENDPOINT,
-		USB_ENDPOINT_OUT | HID_EP_OUT, USB_ENDPOINT_TYPE_INTERRUPT, 0x40, 0x01
+		USB_ENDPOINT_OUT | HID_EP_OUT, USB_ENDPOINT_TYPE_INTERRUPT, 0x40, 0x01,
+		audio_iad, sizeof(audio_iad)
+	},
+	/* Audio streaming endpoint: one 192-byte packet per millisecond */
+	{
+		USB_DT_ENDPOINT_AUDIO_SIZE, USB_DT_ENDPOINT,
+		USB_ENDPOINT_IN | AUDIO_EP_IN, UAC_EP_ISO_ASYNC, UAC_PACKET_BYTES, 0x04,
+		audio_ep_extra, sizeof(audio_ep_extra)
 	},
 	{0}
 };
 
 /* Hi-Speed interface descriptor */
 static
-struct SceUdcdInterfaceDescriptor interdesc_hi[4] = {
+struct SceUdcdInterfaceDescriptor interdesc_hi[7] = {
 	{	/* Standard Video Control Interface Descriptor */
 		USB_DT_INTERFACE_SIZE,
 		USB_DT_INTERFACE,
@@ -373,15 +460,35 @@ struct SceUdcdInterfaceDescriptor interdesc_hi[4] = {
 		USB_CLASS_HID, 0x00, 0x00, 0,
 		&endpdesc_hi[1], (void *)&hiddesc, sizeof(hiddesc)
 	},
+	{	/* Audio Control */
+		USB_DT_INTERFACE_SIZE, USB_DT_INTERFACE,
+		AUDIO_CONTROL_INTERFACE, 0, 0,
+		USB_CLASS_AUDIO, UAC_SUBCLASS_AUDIOCONTROL, 0x00, 0,
+		NULL, audio_control_cs, sizeof(audio_control_cs)
+	},
+	{	/* Audio Streaming, alternate 0: idle, no bandwidth */
+		USB_DT_INTERFACE_SIZE, USB_DT_INTERFACE,
+		AUDIO_STREAM_INTERFACE, 0, 0,
+		USB_CLASS_AUDIO, UAC_SUBCLASS_AUDIOSTREAMING, 0x00, 0,
+		NULL, NULL, 0
+	},
+	{	/* Audio Streaming, alternate 1: streaming */
+		USB_DT_INTERFACE_SIZE, USB_DT_INTERFACE,
+		AUDIO_STREAM_INTERFACE, 1, 1,
+		USB_CLASS_AUDIO, UAC_SUBCLASS_AUDIOSTREAMING, 0x00, 0,
+		&endpdesc_hi[3], audio_stream_cs, sizeof(audio_stream_cs)
+	},
 	{0}
 };
 
 /* Hi-Speed settings */
 static
-struct SceUdcdInterfaceSettings settings_hi[3] = {
+struct SceUdcdInterfaceSettings settings_hi[5] = {
 	{&interdesc_hi[0], 0, 1},
 	{&interdesc_hi[1], 0, 1},
 	{&interdesc_hi[2], 0, 1},
+	{&interdesc_hi[3], 0, 1},
+	{&interdesc_hi[4], 0, 2},	/* audio streaming: alternates 0 and 1 */
 };
 
 /* Hi-Speed configuration descriptor */
@@ -391,8 +498,9 @@ struct SceUdcdConfigDescriptor confdesc_hi = {
 	USB_DT_CONFIG,
 	    (USB_DT_CONFIG_SIZE + 3 * USB_DT_INTERFACE_SIZE + 3 * USB_DT_ENDPOINT_SIZE +
 		sizeof(video_control_descriptors) +
-		sizeof(video_streaming_descriptors) + sizeof(hiddesc)),	/* wTotalLength */
-	3,			/* bNumInterfaces */
+		sizeof(video_streaming_descriptors) + sizeof(hiddesc) +
+		AUDIO_DESC_BYTES),	/* wTotalLength */
+	5,			/* bNumInterfaces */
 	1,			/* bConfigurationValue */
 	0,			/* iConfiguration */
 	0x80,			/* bmAttributes */
@@ -432,7 +540,7 @@ struct SceUdcdDeviceDescriptor devdesc_full = {
 
 /* Full-Speed endpoint descriptors */
 static
-struct SceUdcdEndpointDescriptor endpdesc_full[4] = {
+struct SceUdcdEndpointDescriptor endpdesc_full[5] = {
 	{
 		USB_DT_ENDPOINT_SIZE, USB_DT_ENDPOINT,
 		USB_ENDPOINT_IN | 0x01, USB_ENDPOINT_TYPE_BULK, 0x40, 0x00
@@ -443,14 +551,21 @@ struct SceUdcdEndpointDescriptor endpdesc_full[4] = {
 	},
 	{
 		USB_DT_ENDPOINT_SIZE, USB_DT_ENDPOINT,
-		USB_ENDPOINT_OUT | HID_EP_OUT, USB_ENDPOINT_TYPE_INTERRUPT, 0x40, 0x01
+		USB_ENDPOINT_OUT | HID_EP_OUT, USB_ENDPOINT_TYPE_INTERRUPT, 0x40, 0x01,
+		audio_iad, sizeof(audio_iad)
+	},
+	/* Audio streaming endpoint: one 192-byte packet per millisecond */
+	{
+		USB_DT_ENDPOINT_AUDIO_SIZE, USB_DT_ENDPOINT,
+		USB_ENDPOINT_IN | AUDIO_EP_IN, UAC_EP_ISO_ASYNC, UAC_PACKET_BYTES, 0x01,
+		audio_ep_extra, sizeof(audio_ep_extra)
 	},
 	{0}
 };
 
 /* Full-Speed interface descriptor */
 static
-struct SceUdcdInterfaceDescriptor interdesc_full[4] = {
+struct SceUdcdInterfaceDescriptor interdesc_full[7] = {
 	{	/* Standard Video Control Interface Descriptor */
 		USB_DT_INTERFACE_SIZE,
 		USB_DT_INTERFACE,
@@ -486,15 +601,35 @@ struct SceUdcdInterfaceDescriptor interdesc_full[4] = {
 		USB_CLASS_HID, 0x00, 0x00, 0,
 		&endpdesc_full[1], (void *)&hiddesc, sizeof(hiddesc)
 	},
+	{	/* Audio Control */
+		USB_DT_INTERFACE_SIZE, USB_DT_INTERFACE,
+		AUDIO_CONTROL_INTERFACE, 0, 0,
+		USB_CLASS_AUDIO, UAC_SUBCLASS_AUDIOCONTROL, 0x00, 0,
+		NULL, audio_control_cs, sizeof(audio_control_cs)
+	},
+	{	/* Audio Streaming, alternate 0: idle, no bandwidth */
+		USB_DT_INTERFACE_SIZE, USB_DT_INTERFACE,
+		AUDIO_STREAM_INTERFACE, 0, 0,
+		USB_CLASS_AUDIO, UAC_SUBCLASS_AUDIOSTREAMING, 0x00, 0,
+		NULL, NULL, 0
+	},
+	{	/* Audio Streaming, alternate 1: streaming */
+		USB_DT_INTERFACE_SIZE, USB_DT_INTERFACE,
+		AUDIO_STREAM_INTERFACE, 1, 1,
+		USB_CLASS_AUDIO, UAC_SUBCLASS_AUDIOSTREAMING, 0x00, 0,
+		&endpdesc_full[3], audio_stream_cs, sizeof(audio_stream_cs)
+	},
 	{0}
 };
 
 /* Full-Speed settings */
 static
-struct SceUdcdInterfaceSettings settings_full[3] = {
+struct SceUdcdInterfaceSettings settings_full[5] = {
 	{&interdesc_full[0], 0, 1},
 	{&interdesc_full[1], 0, 1},
-	{&interdesc_full[2], 0, 1}
+	{&interdesc_full[2], 0, 1},
+	{&interdesc_full[3], 0, 1},
+	{&interdesc_full[4], 0, 2}	/* audio streaming: alternates 0 and 1 */
 };
 
 /* Full-Speed configuration descriptor */
@@ -504,8 +639,9 @@ struct SceUdcdConfigDescriptor confdesc_full = {
 	USB_DT_CONFIG,
 	    (USB_DT_CONFIG_SIZE + 3 * USB_DT_INTERFACE_SIZE + 3 * USB_DT_ENDPOINT_SIZE +
 		sizeof(video_control_descriptors) +
-		sizeof(video_streaming_descriptors) + sizeof(hiddesc)),	/* wTotalLength */
-	3,			/* bNumInterfaces */
+		sizeof(video_streaming_descriptors) + sizeof(hiddesc) +
+		AUDIO_DESC_BYTES),	/* wTotalLength */
+	5,			/* bNumInterfaces */
 	1,			/* bConfigurationValue */
 	0,			/* iConfiguration */
 	0x80,			/* bmAttributes */

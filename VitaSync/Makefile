@@ -1,5 +1,5 @@
 TARGET	= VitaSync
-OBJS	= src/main.o
+OBJS	= src/main.o src/audio.o
 LIBS	= -lSceSysmemForDriver_stub -lSceThreadmgrForDriver_stub \
 	-lSceCpuForDriver_stub -lSceUdcdForDriver_stub \
 	-lSceDisplayForDriver_stub -lSceIftuForDriver_stub \

@@ -59,6 +59,7 @@ screen, records it, and sends input.
 
    ```bash
    ./linux/vitactl.py watch start     # screen kept in $XDG_RUNTIME_DIR/vitactl/latest.png
+   ./linux/vitactl.py watch start --size 864x488   # smaller video, more frames/s (below)
    ./linux/vitactl.py press CROSS     # SELECT START UP RIGHT DOWN LEFT L R TRIANGLE CIRCLE CROSS SQUARE
                                       # PS VOLUP VOLDOWN, L3 R3 (PS TV and controllers only)
    ./linux/vitactl.py hold L R 2000
@@ -77,6 +78,17 @@ screen, records it, and sends input.
    ./linux/vitactl.py status          # devices, video, and what the plugin reports
    ./linux/vitactl.py watch stop
    ```
+
+Video sizes and the frames per second measured over USB 2 (2026-11-22). Shots are
+always 960x544 (scaled up); recordings keep the real size.
+
+| `--size` | frames/s |
+|---|---|
+| 960x544 (default) | 47 |
+| 896x504 | 54 |
+| 864x488 | 57 |
+| 480x272 | 60 |
+| 1280x720 | 29 (the plugin's limit; upscaled, no gain) |
 
 Opening VitaShell's USB transfer takes USB away from the plugin; it takes USB
 back by itself a few seconds after the transfer is closed.

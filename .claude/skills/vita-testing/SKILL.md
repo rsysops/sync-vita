@@ -174,7 +174,9 @@ Tell the user, in a few numbered lines:
    No `1337` after a minute: say so and stop (the plugin isn't running, or
    needs a reboot and henlo).
 2. **Video, then screen.** `$VITACTL watch start` (one attempt; if it fails,
-   follow its advice, don't retry in a loop). Create the results folder now,
+   follow its advice, don't retry in a loop). The default 960x544 gives about
+   47 frames/s; to measure a 60 fps game, `--size 864x488` (57/s) or
+   `480x272` (60/s) instead (`watch stop` first to change size). Create the results folder now,
    `DEST=/tmp/<project>-$(date +%Y%m%d-%H%M)`, and save every shot there:
    `$VITACTL shot "$DEST/01-<what>.png"`. Look at each shot before the next
    input.

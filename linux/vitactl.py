@@ -3,6 +3,9 @@
 send it buttons, sticks and touches over USB.
 
   vitactl.py watch start|stop|status   keep the screen in latest.png (3 fps)
+             start --size WxH          video size: 960x544 (default, ~47 frames/s),
+                                       896x504, 864x488, 480x272, 1280x720;
+                                       shots are always 960x544
   vitactl.py press BTN... [ms]         tap buttons (default 150 ms)
   vitactl.py hold BTN... ms            hold buttons
   vitactl.py stick L|R x y ms          move a stick (0-255, 128 = centre)
@@ -68,6 +71,9 @@ REPORT_ID_HEARTBEAT = 1   # Vita -> PC, about every 500 ms
 HEARTBEAT_MAGIC = 0xC7
 RESEND_S = 0.1            # the plugin drops input after 1 s without reports
 SCREEN_W, SCREEN_H = 960, 544
+# Sizes the plugin offers (scaled by the Vita's hardware). Bigger frames are
+# slower over USB 2: 960x544 gives about 47 frames/s.
+VIDEO_SIZES = ("960x544", "896x504", "864x488", "480x272", "1280x720")
 TOUCH_SCALE = 2           # touch grid is 1920x1088
 FRAME_MAX_AGE_S = 3.0     # older than this, the stream is considered stopped
 RING_SEGMENTS = 20        # watch keeps this many 1 s pieces of full-rate video
@@ -179,8 +185,20 @@ def recent_uvc_kernel_lines():
     return [l for l in out.splitlines() if "uvcvideo" in l][-3:]
 
 
-def watch_start():
+def watch_size():
+    try:
+        with open(state_file("size")) as f:
+            return f.read().strip() or "960x544"
+    except OSError:
+        return "960x544"
+
+
+def watch_start(size="960x544"):
+    if size not in VIDEO_SIZES:
+        raise VitaError(f"--size must be one of {', '.join(VIDEO_SIZES)}")
     if watch_pid():
+        if watch_size() != size:
+            raise VitaError(f"watch is running at {watch_size()}; `watch stop` first to change size")
         print(f"watch already running; screen in {state_file('latest.png')}")
         return
     video = find_video()
@@ -198,8 +216,8 @@ def watch_start():
     # stays bounded.
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
            "-f", "v4l2", "-ts", "mono2abs", "-input_format", "nv12",
-           "-video_size", f"{SCREEN_W}x{SCREEN_H}", "-i", video, "-copyts",
-           "-map", "0:v", "-vf", "fps=3",
+           "-video_size", size, "-i", video, "-copyts",
+           "-map", "0:v", "-vf", f"fps=3,scale={SCREEN_W}:{SCREEN_H}",
            "-f", "image2", "-update", "1", "-atomic_writing", "1", latest,
            "-map", "0:v", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12",
            "-g", "10", "-fps_mode", "passthrough",
@@ -213,6 +231,8 @@ def watch_start():
     with open(log_path, "w") as log:
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=True)
+    with open(state_file("size"), "w") as f:
+        f.write(size)
     with open(state_file("ffmpeg.pid"), "w") as f:
         f.write(str(proc.pid))
     while time.time() - started < 8 and proc.poll() is None:
@@ -253,7 +273,30 @@ def watch_state():
         return "not running"
     if age is None or age > FRAME_MAX_AGE_S:
         return f"running (pid {pid}) but no recent frame" + ("" if age is None else f" (last {age:.0f} s ago)")
-    return f"running (pid {pid}), last frame {age:.1f} s ago, {state_file('latest.png')}"
+    rate = ring_rate()
+    rate = f", {rate:.1f} frames/s over the last {RATE_PIECES} s" if rate else ""
+    return (f"running (pid {pid}) at {watch_size()}{rate}, last frame {age:.1f} s ago, "
+            f"{state_file('latest.png')}")
+
+
+RATE_PIECES = 5
+
+
+def ring_rate():
+    """Frames per second the Vita delivered over the last complete pieces."""
+    pieces = ring_pieces()[-RATE_PIECES:]
+    if len(pieces) < 2:
+        return None
+    frames = 0
+    for path, _, _ in pieces:
+        r = subprocess.run(["ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0",
+                            "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path],
+                           capture_output=True, text=True)
+        try:
+            frames += int(r.stdout.split(",")[0])
+        except ValueError:
+            return None
+    return frames / (pieces[-1][2] - pieces[0][1])
 
 
 def need_watch():
@@ -841,13 +884,19 @@ def run_command(argv):
     if cmd == "watch":
         sub = args[0] if args else ""
         if sub == "start":
-            watch_start()
+            rest = args[1:]
+            if rest[:1] == ["--size"] and len(rest) == 2:
+                watch_start(rest[1])
+            elif not rest:
+                watch_start()
+            else:
+                raise VitaError("usage: watch start [--size WxH]")
         elif sub == "stop":
             watch_stop()
         elif sub == "status":
             print(watch_state())
         else:
-            raise VitaError("usage: watch start|stop|status")
+            raise VitaError("usage: watch start [--size WxH] | stop | status")
     elif cmd == "press":
         cmd_press(args, 150)
     elif cmd == "hold":

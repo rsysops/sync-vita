@@ -1,14 +1,14 @@
 # VitaSync — PS Vita streaming & control over USB
 
-See the PS Vita's screen on a Linux PC **and** control the console (buttons,
+See and hear the PS Vita on a Linux PC **and** control the console (buttons,
 sticks, front and rear touch, PS and volume) over USB, from the command line.
 
 Prototype based on a modified fork of **`vita-udcd-uvc` 1.7** (`xerpi/vita-udcd-uvc`, MIT license).
 
 ## What's in it
 
-- `VitaSync/` — Vita kernel plugin (`VitaSync.skprx`): UVC video + vendor HID
-  USB interface. UVC device name: `PSVita`, USB ID `054c:1337`.
+- `VitaSync/` — Vita kernel plugin (`VitaSync.skprx`): UVC video, USB audio
+  (the Vita's sound) and vendor HID. Device name `PSVita`, USB ID `054c:1337`.
 - `linux/` — `vitactl.py`, the command-line tool (screen, recordings, input),
   and the udev rule it needs.
 - `TESTING.md` — an end-to-end test scenario; `TODO.md` — known problems and
@@ -60,6 +60,7 @@ screen, records it, and sends input.
    ```bash
    ./linux/vitactl.py watch start     # screen kept in $XDG_RUNTIME_DIR/vitactl/latest.png
    ./linux/vitactl.py watch start --size 864x488   # smaller video, more frames/s (below)
+   ./linux/vitactl.py watch start --audio          # also the Vita's sound, kept for `record`
    ./linux/vitactl.py press CROSS     # SELECT START UP RIGHT DOWN LEFT L R TRIANGLE CIRCLE CROSS SQUARE
                                       # PS VOLUP VOLDOWN, L3 R3 (PS TV and controllers only)
    ./linux/vitactl.py hold L R 2000
@@ -73,7 +74,8 @@ screen, records it, and sends input.
    ./linux/vitactl.py record 3 clip.mkv --before 2   # every frame (~47/s) of the next 3 s
                                       # and the 2 s before; inputs noted in clip.mkv.json
    ./linux/vitactl.py analyze clip.mkv   # frame rate, freezes, sudden changes, input delays,
-                                         # with pictures of each in clip-analysis/
+                                         # with pictures of each in clip-analysis/; with
+                                         # sound: loudness, silences, sudden sounds, waveform
    ./linux/vitactl.py run steps.txt   # one command per line, plus "wait ms"
    ./linux/vitactl.py status          # devices, video, and what the plugin reports
    ./linux/vitactl.py watch stop
@@ -89,6 +91,17 @@ always 960x544 (scaled up); recordings keep the real size.
 | 864x488 | 57 |
 | 480x272 | 60 |
 | 1280x720 | 29 (the plugin's limit; upscaled, no gain) |
+
+**Sound** (plugin build 101+). The Vita is also a USB sound card: Linux lists it
+as `card PSVita` (48 kHz, stereo, 16-bit), carrying the Vita's final mix (games,
+system sounds, music). While the PC has it open, the Vita's own speaker and
+headphones are silent; they come back when it's closed. `watch start --audio`
+keeps it open for the ring buffer, so `record` saves sound with the video. For a
+plain WAV:
+
+```bash
+arecord -D hw:CARD=PSVita,DEV=0 -f S16_LE -r 48000 -c 2 -d 10 sound.wav
+```
 
 Opening VitaShell's USB transfer takes USB away from the plugin; it takes USB
 back by itself a few seconds after the transfer is closed.

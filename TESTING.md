@@ -34,11 +34,31 @@ report.
   960 x 544; the shot shows LiveArea.
 - **Record:** frame age, what the shot shows.
 
-## 2. Audio (not yet)
+## 2. Sound
 
-- **Skipped.** The plugin doesn't send sound to the PC in this build (see
-  TODO.md, "Audio to the PC").
-- **Record:** "skipped".
+- **Do:** `$VITACTL watch stop`, then `$VITACTL watch start --audio`, and
+  `$VITACTL watch status`. Then, from LiveArea:
+
+  ```bash
+  printf '%s\n' "wait 600" "press VOLUP" "wait 1000" "press VOLDOWN" "wait 1000" \
+      "touch 705 150" "wait 2000" "press PS" "wait 800" > "$DEST/sound-steps.txt"
+  $VITACTL record 6 "$DEST/sound.mkv" --before 1 & sleep 0.3
+  $VITACTL run "$DEST/sound-steps.txt"; wait
+  $VITACTL analyze "$DEST/sound.mkv"
+  ```
+
+  Ask the user to listen to the Vita during it. Then `$VITACTL watch stop` and
+  `$VITACTL watch start` (without sound) for the next steps.
+- **Pass:**
+  - `watch status` says "with sound";
+  - the recording says "with sound";
+  - `analyze` shows a sound section that isn't "silent all along", and a
+    "sound reacts" figure per input; `audio.png` shows the waveform;
+  - the user hears the Vita go silent while sound is captured, and come back
+    after `watch stop`.
+- **Record:** the levels, the sudden sounds, the reaction times. If the Vita
+  had gone to sleep (lock screen, frozen picture, silence), unlock it and
+  start the step again.
 
 ## 3. Inputs
 

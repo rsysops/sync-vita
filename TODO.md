@@ -1,13 +1,25 @@
 # TODO
 
-## Audio to the PC
+## Sound: what's left
 
-The plugin doesn't send the Vita's sound to the PC. Its USB device has video
-and HID interfaces only, and the audio code in `VitaSync/src/main.c` is
-compiled out: `ENABLE_AUDIO_HOOKTRY 0` (no `sceAudioOutOutput` hook) and
-`ENABLE_AUDIO_STREAM 0` (no streaming). Enabling it is a task of its own: a
-USB audio interface (or audio over the HID endpoint), the hook, and a reader in
-`vitactl.py`. Step 2 of [TESTING.md](TESTING.md) waits for it.
+Sound works since plugin build 101 (`src/audio.c`). Still to do:
+
+- **Measure the sound/picture offset.** Both are stamped with the PC's clock,
+  but the sound spends about 50 ms in the Vita's buffers (plugin ring, 8 ms
+  USB request, 10.7 ms read block). Measure it, e.g. VOL+'s click against the
+  volume bar appearing, in a quiet place, and correct it in `record`.
+- **Long captures.** 3 minutes showed no drift problem; check 30 minutes or
+  more (the ring skips or rebuffers, counted in `status`).
+- **Keep the Vita awake while recording.** The plugin keeps it awake only
+  while input flows; a recording made after a while without input can show
+  the screen off (frozen picture, silence).
+
+## Video: the 2 ms wait after each frame conversion
+
+`uvc_frame_transfer`'s caller waits 2 ms after the IFTU conversion. The wait
+came from the build that hid audio in the frames; its comment says the IFTU
+DMA finishes after the call returns. Try without it (or with a shorter
+wait), and measure the frame rate (`watch status`) and look for torn frames.
 
 ## VitaShell's USB transfer freezes the Vita after the PC used the HID interface
 

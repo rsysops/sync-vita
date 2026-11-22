@@ -6,6 +6,9 @@ send it buttons, sticks and touches over USB.
              start --size WxH          video size: 960x544 (default, ~47 frames/s),
                                        896x504, 864x488, 480x272, 1280x720;
                                        shots are always 960x544
+             start --audio             also the Vita's sound (plugin build 101+),
+                                       kept with the video for `record`; the Vita
+                                       is silent until `watch stop`
   vitactl.py press BTN... [ms]         tap buttons (default 150 ms)
   vitactl.py hold BTN... ms            hold buttons
   vitactl.py stick L|R x y ms          move a stick (0-255, 128 = centre)
@@ -18,7 +21,9 @@ send it buttons, sticks and touches over USB.
                                        save every frame of the next SECONDS (and
                                        of the S seconds before, up to 15) to FILE
   vitactl.py analyze FILE.mkv          frame rate, freezes, sudden changes and
-                                       input-to-screen delays of a recording
+                                       input-to-screen delays of a recording; with
+                                       sound: loudness, silences, sudden sounds and
+                                       input-to-sound delays
   vitactl.py run FILE                  run commands from FILE (plus "wait ms")
   vitactl.py kill                      quit the game (only games that read touch)
   vitactl.py status                    devices, watch, and what the Vita reports
@@ -38,8 +43,10 @@ all input when the video stream stops, so don't stop `watch` in the middle
 of an input command. Standard library only.
 """
 
+import array
 import glob
 import json
+import math
 import os
 import select
 import shlex
@@ -73,6 +80,7 @@ RESEND_S = 0.1            # the plugin drops input after 1 s without reports
 SCREEN_W, SCREEN_H = 960, 544
 # Sizes the plugin offers (scaled by the Vita's hardware). Bigger frames are
 # slower over USB 2: 960x544 gives about 47 frames/s.
+AUDIO_DEVICE = "hw:CARD=PSVita,DEV=0"   # the plugin's USB sound card (build 101+)
 VIDEO_SIZES = ("960x544", "896x504", "864x488", "480x272", "1280x720")
 TOUCH_SCALE = 2           # touch grid is 1920x1088
 FRAME_MAX_AGE_S = 3.0     # older than this, the stream is considered stopped
@@ -193,17 +201,37 @@ def watch_size():
         return "960x544"
 
 
-def watch_start(size="960x544"):
+def watch_audio():
+    try:
+        with open(state_file("audio")) as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def audio_card_present():
+    try:
+        with open("/proc/asound/cards") as f:
+            return "PSVita" in f.read()
+    except OSError:
+        return False
+
+
+def watch_start(size="960x544", audio=False):
     if size not in VIDEO_SIZES:
         raise VitaError(f"--size must be one of {', '.join(VIDEO_SIZES)}")
     if watch_pid():
-        if watch_size() != size:
-            raise VitaError(f"watch is running at {watch_size()}; `watch stop` first to change size")
+        if watch_size() != size or watch_audio() != audio:
+            raise VitaError(f"watch is running at {watch_size()}"
+                            f"{' with sound' if watch_audio() else ''}; "
+                            "`watch stop` first to change size or sound")
         print(f"watch already running; screen in {state_file('latest.png')}")
         return
     video = find_video()
     if not video:
         raise VitaError("Vita video not found (no /dev/video* named PSVita). Is the plugin running?")
+    if audio and not audio_card_present():
+        raise VitaError("no PSVita sound card (arecord -l); the plugin needs build 101 or later")
     latest = state_file("latest.png")
     log_path = state_file("ffmpeg.log")
     ring = ring_dir()
@@ -214,13 +242,19 @@ def watch_start(size="960x544"):
     # `record`. Each piece starts at time 0 (concat needs real lengths); the
     # list keeps its wall-clock start. The pieces wrap around, so memory use
     # stays bounded.
+    # With --audio, the Vita's sound card is a second input: ALSA stamps its
+    # packets with the wall clock too, so the pieces carry both in sync.
+    sound_in = ["-f", "alsa", "-thread_queue_size", "1024", "-sample_rate", "48000",
+                "-channels", "2", "-i", AUDIO_DEVICE] if audio else []
+    sound_out = ["-map", "1:a", "-c:a", "pcm_s16le"] if audio else []
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
            "-f", "v4l2", "-ts", "mono2abs", "-input_format", "nv12",
-           "-video_size", size, "-i", video, "-copyts",
+           "-thread_queue_size", "32", "-video_size", size, "-i", video] + sound_in + [
+           "-copyts",
            "-map", "0:v", "-vf", f"fps=3,scale={SCREEN_W}:{SCREEN_H}",
            "-f", "image2", "-update", "1", "-atomic_writing", "1", latest,
            "-map", "0:v", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12",
-           "-g", "10", "-fps_mode", "passthrough",
+           "-g", "10", "-fps_mode", "passthrough"] + sound_out + [
            "-f", "segment", "-segment_time", "1", "-segment_wrap", str(RING_FILES),
            "-segment_format", "matroska", "-reset_timestamps", "1",
            "-segment_list", os.path.join(ring, "list.csv"), "-segment_list_type", "csv",
@@ -233,6 +267,8 @@ def watch_start(size="960x544"):
                                 stderr=subprocess.STDOUT, start_new_session=True)
     with open(state_file("size"), "w") as f:
         f.write(size)
+    with open(state_file("audio"), "w") as f:
+        f.write("1" if audio else "0")
     with open(state_file("ffmpeg.pid"), "w") as f:
         f.write(str(proc.pid))
     while time.time() - started < 8 and proc.poll() is None:
@@ -275,7 +311,8 @@ def watch_state():
         return f"running (pid {pid}) but no recent frame" + ("" if age is None else f" (last {age:.0f} s ago)")
     rate = ring_rate()
     rate = f", {rate:.1f} frames/s over the last {RATE_PIECES} s" if rate else ""
-    return (f"running (pid {pid}) at {watch_size()}{rate}, last frame {age:.1f} s ago, "
+    sound = " with sound" if watch_audio() else ""
+    return (f"running (pid {pid}) at {watch_size()}{sound}{rate}, last frame {age:.1f} s ago, "
             f"{state_file('latest.png')}")
 
 
@@ -296,7 +333,8 @@ def ring_rate():
             frames += int(r.stdout.split(",")[0])
         except ValueError:
             return None
-    return frames / (pieces[-1][2] - pieces[0][1])
+    # Right after a start the first pieces can be empty: no figure yet.
+    return frames / (pieces[-1][2] - pieces[0][1]) if frames else None
 
 
 def need_watch():
@@ -435,21 +473,24 @@ def record(secs, name, before):
         with open(listing, "w") as f:
             f.writelines(f"file '{p[0]}'\n" for p in pieces)
         start = max(t0, first) - first
+        end = start + (t1 - max(t0, first))
+        sound = has_audio(pieces[0][0])
+        sound_args = ["-af", f"atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS",
+                      "-c:a", "pcm_s16le"] if sound else []
         run_quiet(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                    "-f", "concat", "-safe", "0", "-i", listing,
-                   "-vf", f"trim=start={start:.3f}:end={start + (t1 - max(t0, first)):.3f},"
-                          "setpts=PTS-STARTPTS",
+                   "-vf", f"trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS",
                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "12",
-                   "-fps_mode", "passthrough", name], "saving the recording")
+                   "-fps_mode", "passthrough"] + sound_args + [name], "saving the recording")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     t0 = max(t0, first)
-    info = {"start": round(t0, 3), "seconds": round(t1 - t0, 3),
+    info = {"start": round(t0, 3), "seconds": round(t1 - t0, 3), "audio": sound,
             "inputs": inputs_between(t0, t1)}
     with open(name + ".json", "w") as f:
         json.dump(info, f, indent=1)
     frames = frame_times(name)
-    print(f"{name}: {len(frames)} frames over {t1 - t0:.1f} s, "
+    print(f"{name}: {len(frames)} frames over {t1 - t0:.1f} s{' with sound' if sound else ''}, "
           f"{len(info['inputs'])} inputs (in {name}.json)")
 
 
@@ -477,6 +518,86 @@ def filter_times(name, vf, key):
         if key in line:
             out.append(line)
     return out
+
+
+def has_audio(name):
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+                        "stream=index", "-of", "csv=p=0", name], capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+
+SOUND_STEP = 0.01        # loudness windows: 10 ms
+SILENT_DB = -60.0
+ONSET_DB = 12.0          # a sudden sound: this much above the 200 ms before it...
+ONSET_FLOOR_DB = -50.0   # ...and louder than this
+
+
+def loudness(name):
+    """RMS level in dBFS of each 10 ms of the (mono-mixed) sound."""
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", name,
+                        "-map", "0:a", "-ac", "1", "-ar", "48000", "-f", "s16le", "-"],
+                       capture_output=True)
+    pcm = array.array("h")
+    pcm.frombytes(r.stdout[:len(r.stdout) // 2 * 2])
+    n = int(48000 * SOUND_STEP)
+    out = []
+    for i in range(0, len(pcm) - n + 1, n):
+        power = sum(x * x for x in pcm[i:i + n]) / n
+        out.append(10 * math.log10(power / 32768 ** 2) if power > 0 else -120.0)
+    return out
+
+
+def sound_onsets(db):
+    """Indexes of windows where a sound starts suddenly."""
+    onsets, last = [], -100
+    for k in range(20, len(db)):
+        before = sorted(db[k - 20:k])[10]
+        if db[k] >= before + ONSET_DB and db[k] > ONSET_FLOOR_DB and k - last >= 10:
+            onsets.append(k)
+            last = k
+    return onsets
+
+
+def sound_section(name, info, lines, events, duration):
+    """Add the sound part of the report; returns the onset times."""
+    db = loudness(name)
+    if not db:
+        lines.append("sound: none decoded")
+        return []
+    k_sound = next((k for k, v in enumerate(db) if v > SILENT_DB), None)
+    power = sum(10 ** (v / 10) for v in db) / len(db)
+    lines.append(f"sound: {len(db) * SOUND_STEP:.2f} s, peak {max(db):.1f} dB, average "
+                 f"{10 * math.log10(power) if power > 0 else -120:.1f} dB, "
+                 f"{100 * sum(1 for v in db if v <= SILENT_DB) / len(db):.0f}% silent "
+                 f"(below {SILENT_DB:.0f} dB)")
+    if k_sound is None:
+        lines.append("  silent all along")
+        return []
+    run = 0
+    silences = []
+    for k in range(k_sound, len(db) + 1):
+        if k < len(db) and db[k] <= SILENT_DB:
+            run += 1
+            continue
+        if run * SOUND_STEP >= 0.1:
+            silences.append(((k - run) * SOUND_STEP, run * SOUND_STEP))
+        run = 0
+    for t, length in silences[:10]:
+        lines.append(f"  silence for {length * 1000:.0f} ms from {t:.3f} s")
+    onsets = [k * SOUND_STEP for k in sound_onsets(db)]
+    for t in onsets[:15]:
+        lines.append(f"  sudden sound at {t:.3f} s ({db[int(round(t / SOUND_STEP))]:.0f} dB)")
+        events.append((t, "sound"))
+    lines.append("  (sound and picture times both come from the PC's clock; the sound also "
+                 "spends about 50 ms in the Vita's buffers, not corrected: compare reaction "
+                 "times between builds rather than as absolute values)")
+    return onsets
+
+
+def sound_response(onsets, t_in):
+    after = [t for t in onsets if t_in < t <= t_in + 1.5]
+    return f"sound reacts {(after[0] - t_in) * 1000:.0f} ms later" if after \
+        else "no new sound within 1.5 s"
 
 
 SMALL_W, SMALL_H = 120, 68   # analysis works on small grey frames
@@ -569,8 +690,11 @@ def analyze(name):
         lines.append(f"  sudden change at {t:.3f} s ({share * 100:.0f}% of the screen)")
         events.append((max(t - typical, 0), "before-change"))
         events.append((t, "change"))
+    onsets = sound_section(name, info, lines, events, duration) if has_audio(name) else None
     for inp in info.get("inputs", []):
-        lines.append(f"  input at {inp['t']:.3f} s: {inp['input']}, " + input_response(times, small, inp["t"], events))
+        lines.append(f"  input at {inp['t']:.3f} s: {inp['input']}, " +
+                     input_response(times, small, inp["t"], events) +
+                     (", " + sound_response(onsets, inp["t"]) if onsets is not None else ""))
 
     if not small:
         lines.append("  (frame comparison skipped: frame count mismatch)")
@@ -589,6 +713,17 @@ def analyze(name):
               "making the overview sheet")
     lines.append(f"sheet.png: 16 frames, one every {step * duration / len(times):.2f} s, "
                  "left to right, top to bottom")
+    if onsets is not None:
+        run_quiet(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", name,
+                   "-filter_complex",
+                   # Square-root scale so quiet sounds show; black background.
+                   f"color=c=black:s=960x200[bg];"
+                   f"[0:a]aformat=channel_layouts=mono,"
+                   f"showwavespic=s=960x200:colors=white:scale=sqrt[w];"
+                   f"[bg][w]overlay=format=auto,"
+                   f"drawgrid=w={max(960 / max(duration, 0.1), 2):.2f}:h=200:color=gray@0.6",
+                   "-frames:v", "1", os.path.join(out, "audio.png")], "drawing the waveform")
+        lines.append("audio.png: the waveform, a grey line every second")
     lines.append(f"pictures and this report: {out}/")
     with open(os.path.join(out, "report.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -905,19 +1040,21 @@ def run_command(argv):
     if cmd == "watch":
         sub = args[0] if args else ""
         if sub == "start":
-            rest = args[1:]
-            if rest[:1] == ["--size"] and len(rest) == 2:
-                watch_start(rest[1])
-            elif not rest:
-                watch_start()
-            else:
-                raise VitaError("usage: watch start [--size WxH]")
+            rest, size, audio = args[1:], "960x544", False
+            while rest:
+                if rest[0] == "--size" and len(rest) >= 2:
+                    size, rest = rest[1], rest[2:]
+                elif rest[0] == "--audio":
+                    audio, rest = True, rest[1:]
+                else:
+                    raise VitaError("usage: watch start [--size WxH] [--audio]")
+            watch_start(size, audio)
         elif sub == "stop":
             watch_stop()
         elif sub == "status":
             print(watch_state())
         else:
-            raise VitaError("usage: watch start [--size WxH] | stop | status")
+            raise VitaError("usage: watch start [--size WxH] [--audio] | stop | status")
     elif cmd == "press":
         cmd_press(args, 150)
     elif cmd == "hold":

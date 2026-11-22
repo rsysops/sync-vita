@@ -108,7 +108,7 @@ arecord -D hw:CARD=PSVita,DEV=0 -f S16_LE -r 48000 -c 2 -d 10 sound.wav
 Opening VitaShell's USB transfer takes USB away from the plugin; it takes USB
 back by itself a few seconds after the transfer is closed.
 
-[TESTING.md](TESTING.md) is a test scenario that checks video, input and
+[TESTING.md](TESTING.md) is a test scenario that checks video, sound, input and
 VitaShell's FTP together.
 
 `.claude/skills/vita-testing/` is a Claude Code skill that tests a homebrew build on the

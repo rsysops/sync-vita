@@ -1,8 +1,8 @@
 # End-to-end test scenario
 
 A scenario for Claude (or anyone) to run with `linux/vitactl.py`, to check that
-everything works together: video, input, and VitaShell's FTP server running
-alongside them. Each step has **do** (the commands), **pass** (what must be
+everything works together: video, sound (plugin build 101+), input, and
+VitaShell's FTP server running alongside them. Each step has **do** (the commands), **pass** (what must be
 seen) and **record** (what goes in the report). If a step fails, stop there and
 report.
 
@@ -47,15 +47,17 @@ report.
   $VITACTL analyze "$DEST/sound.mkv"
   ```
 
-  Ask the user to listen to the Vita during it. Then `$VITACTL watch stop` and
-  `$VITACTL watch start` (without sound) for the next steps.
+  If the Vita's volume is up, ask the user to listen to it during this. Then
+  `$VITACTL watch stop` and `$VITACTL watch start` (without sound) for the
+  next steps.
 - **Pass:**
   - `watch status` says "with sound";
   - the recording says "with sound";
   - `analyze` shows a sound section that isn't "silent all along", and a
     "sound reacts" figure per input; `audio.png` shows the waveform;
-  - the user hears the Vita go silent while sound is captured, and come back
-    after `watch stop`.
+  - if the Vita's speaker volume is up, the user hears it go silent while
+    sound is captured, and come back after `watch stop` (the capture itself
+    doesn't depend on the volume: it's taken before it).
 - **Record:** the levels, the sudden sounds, the reaction times. If the Vita
   had gone to sleep (lock screen, frozen picture, silence), unlock it and
   start the step again.

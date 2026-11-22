@@ -73,7 +73,7 @@ gamesd, PSVshell, kubridge). Nothing else on `ux0:` belongs to this project.
 ## What to test from
 
 `~/Desktop/vitasync-handoff.md`, "How to check it works". The end-to-end
-scenario (video, input, FTP): `TESTING.md`. For the USB transfer freeze:
+scenario (video, sound, input, FTP): `TESTING.md`. For the USB transfer freeze:
 `TODO.md`.
 
 ## Reading results

@@ -19,7 +19,8 @@ send it buttons, sticks and touches over USB.
   vitactl.py shot NAME                 save the next screen frame as NAME
   vitactl.py record SECONDS FILE.mkv [--before S]
                                        save every frame of the next SECONDS (and
-                                       of the S seconds before, up to 15) to FILE
+                                       of the S seconds before, up to 15) to FILE;
+                                       the sound is shifted to match the picture
   vitactl.py analyze FILE.mkv          frame rate, freezes, sudden changes and
                                        input-to-screen delays of a recording; with
                                        sound: loudness, silences, sudden sounds and
@@ -79,6 +80,17 @@ HEARTBEAT_MAGIC = 0xC7
 RESEND_S = 0.1            # the plugin drops input after 1 s without reports
 SCREEN_W, SCREEN_H = 960, 544
 AUDIO_DEVICE = "hw:CARD=PSVita,DEV=0"   # the plugin's USB sound card (build 101+)
+# How much later the sound reaches the PC than the picture of the same moment
+# (its time in the Vita's buffers, minus the video's own delay); `record`
+# shifts the sound back by this much. Measured on 2026-11-23 with build 106 at
+# 960x544: closing a submenu in Settings (the slide and the sound start
+# together), 17 presses, median 17 ms, 16 of them -3 to +30 ms (one frame).
+# Opening one isn't usable: its first change, a highlight flash, is too small
+# for `analyze` to see. 480x272 (60 frames/s) gave the same: median 22 ms
+# over 10 presses, and the sound itself is no faster. Re-measure the same way
+# if the plugin's buffering changes: `analyze` prints the median as "sound vs
+# picture".
+AUDIO_DELAY_S = 0.017
 # Sizes the plugin offers (scaled by the Vita's hardware), with the frames/s
 # measured over USB 2: 960x544 47, 896x504 54, 864x488 57, 480x272 60.
 # (Plugin builds before 106 also offered 1280x720: upscaled, 30 frames/s at
@@ -461,7 +473,7 @@ def record(secs, name, before):
                     copy = os.path.join(tmp, f"{len(saved):04d}.mkv")
                     shutil.copyfile(path, copy)
                     saved[start] = (copy, start, end)
-            if saved and max(e for _, _, e in saved.values()) >= t1:
+            if saved and max(e for _, _, e in saved.values()) >= t1 + AUDIO_DELAY_S:
                 break
             if time.time() > deadline:
                 raise VitaError("the video pieces stopped coming; is watch still running?")
@@ -477,7 +489,9 @@ def record(secs, name, before):
         start = max(t0, first) - first
         end = start + (t1 - max(t0, first))
         sound = has_audio(pieces[0][0])
-        sound_args = ["-af", f"atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS",
+        # The sound stamped t + AUDIO_DELAY_S goes with the frame stamped t.
+        sound_args = ["-af", f"atrim=start={start + AUDIO_DELAY_S:.3f}:"
+                      f"end={end + AUDIO_DELAY_S:.3f},asetpts=PTS-STARTPTS",
                       "-c:a", "pcm_s16le"] if sound else []
         run_quiet(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                    "-f", "concat", "-safe", "0", "-i", listing,
@@ -489,6 +503,8 @@ def record(secs, name, before):
     t0 = max(t0, first)
     info = {"start": round(t0, 3), "seconds": round(t1 - t0, 3), "audio": sound,
             "inputs": inputs_between(t0, t1)}
+    if sound:
+        info["audio_delay"] = AUDIO_DELAY_S
     with open(name + ".json", "w") as f:
         json.dump(info, f, indent=1)
     frames = frame_times(name)
@@ -590,16 +606,21 @@ def sound_section(name, info, lines, events, duration):
     for t in onsets[:15]:
         lines.append(f"  sudden sound at {t:.3f} s ({db[int(round(t / SOUND_STEP))]:.0f} dB)")
         events.append((t, "sound"))
-    lines.append("  (sound and picture times both come from the PC's clock; the sound also "
-                 "spends about 50 ms in the Vita's buffers, not corrected: compare reaction "
-                 "times between builds rather than as absolute values)")
+    if "audio_delay" in info:
+        lines.append(f"  (sound shifted {info['audio_delay'] * 1000:.0f} ms earlier to match the "
+                     "picture: its extra delay in the Vita's buffers, measured)")
+    else:
+        lines.append("  (sound not shifted to match the picture: it comes about 17 ms late; "
+                     "made before that correction or not by `record`)")
     return onsets
 
 
 def sound_response(onsets, t_in):
+    """(text, delay in seconds or None)"""
     after = [t for t in onsets if t_in < t <= t_in + 1.5]
-    return f"sound reacts {(after[0] - t_in) * 1000:.0f} ms later" if after \
-        else "no new sound within 1.5 s"
+    if not after:
+        return "no new sound within 1.5 s", None
+    return f"sound reacts {(after[0] - t_in) * 1000:.0f} ms later", after[0] - t_in
 
 
 SMALL_W, SMALL_H = 120, 68   # analysis works on small grey frames
@@ -621,12 +642,12 @@ def changed(a, b):
 def input_response(times, small, t_in, events):
     """When the screen first reacts to an input: the first frame that differs
     from the one at the input by more than the screen changes by itself in
-    the 0.3 s before it."""
+    the 0.3 s before it. Returns (text, delay in seconds or None)."""
     if not small:
-        return "no frame comparison"
+        return "no frame comparison", None
     ref = max((i for i, t in enumerate(times) if t <= t_in), default=None)
     if ref is None:
-        return "sent before the recording started"
+        return "sent before the recording started", None
     start = max((i for i, t in enumerate(times) if t <= t_in - 0.3), default=0)
     by_itself = max((changed(small[start], small[j]) for j in range(start, ref + 1)), default=0)
     for j in range(ref + 1, len(times)):
@@ -634,8 +655,8 @@ def input_response(times, small, t_in, events):
             break
         if changed(small[ref], small[j]) > max(by_itself + 0.02, 0.02):
             events.append((times[j], "response"))
-            return f"screen reacts {(times[j] - t_in) * 1000:.0f} ms later"
-    return "no visible reaction within 1.5 s"
+            return f"screen reacts {(times[j] - t_in) * 1000:.0f} ms later", times[j] - t_in
+    return "no visible reaction within 1.5 s", None
 
 
 def analyze(name):
@@ -693,10 +714,23 @@ def analyze(name):
         events.append((max(t - typical, 0), "before-change"))
         events.append((t, "change"))
     onsets = sound_section(name, info, lines, events, duration) if has_audio(name) else None
+    gaps_av = []   # sound reaction minus screen reaction, per input
     for inp in info.get("inputs", []):
-        lines.append(f"  input at {inp['t']:.3f} s: {inp['input']}, " +
-                     input_response(times, small, inp["t"], events) +
-                     (", " + sound_response(onsets, inp["t"]) if onsets is not None else ""))
+        screen, t_screen = input_response(times, small, inp["t"], events)
+        line = f"  input at {inp['t']:.3f} s: {inp['input']}, {screen}"
+        if onsets is not None:
+            sound, t_sound = sound_response(onsets, inp["t"])
+            line += ", " + sound
+            # Further apart, they are most likely not the same event (an input
+            # that only woke a cursor, paired with the next input's sound).
+            if t_screen is not None and t_sound is not None and abs(t_sound - t_screen) <= 0.25:
+                gaps_av.append(t_sound - t_screen)
+        lines.append(line)
+    if len(gaps_av) >= 3:
+        gaps_av.sort()
+        lines.append(f"sound vs picture: the sound reacts {gaps_av[len(gaps_av) // 2] * 1000:+.0f} ms "
+                     f"after the screen (median of {len(gaps_av)} inputs, "
+                     f"{gaps_av[0] * 1000:+.0f} to {gaps_av[-1] * 1000:+.0f} ms)")
 
     if not small:
         lines.append("  (frame comparison skipped: frame count mismatch)")

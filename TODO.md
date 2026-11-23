@@ -2,18 +2,14 @@
 
 ## Sound: what's left
 
-Sound works since plugin build 101 (`src/audio.c`). Still to do:
+Sound works since plugin build 101 (`src/audio.c`); `record` corrects the
+sound/picture offset (17 ms, `AUDIO_DELAY_S` in `vitactl.py`). Still to do:
 
-- **Measure the sound/picture offset.** Both are stamped with the PC's clock,
-  but the sound spends about 50 ms in the Vita's buffers (plugin ring, 8 ms
-  USB request, 10.7 ms read block). Measure it, e.g. VOL+'s click against the
-  volume bar appearing, in a quiet place, and correct it in `record`.
 - **Long captures.** 3 minutes showed no drift problem; check 30 minutes or
   more (the ring skips or rebuffers, counted in `status`).
-- **Keep the Vita awake while recording.** Video capture keeps it awake
-  (uvc_thread, every 10 s); since build 105 sound capture does too (the
-  audio thread), with a wake tick when a sound capture starts. A Vita
-  already asleep before a *video* start still shows a frozen screen.
+- **Wake the Vita when the video starts.** A Vita already asleep when
+  `watch start` runs records a frozen screen (sound capture wakes it since
+  build 105; the video path doesn't).
 
 ## Video: faster frames, and uvc_thread stalling after a stop
 
@@ -38,8 +34,7 @@ the build that hid audio in the frames). Experimental builds 102-104
 Next: debug build (breadcrumbs: `bc_uvc_where`) to see where uvc_thread is
 after a stop, then make the frame path stop cleanly (check `stream` before
 each submit, release the wait from the abort path) before removing the wait
-again. (1280x720, the size being started when 102 hung, was removed from
-the plugin in build 106; frame indexes from the PC are now range-checked.)
+again.
 
 ## VitaShell's USB transfer freezes the Vita after the PC used the HID interface
 
@@ -105,7 +100,7 @@ Every freeze followed HID use (`status` or input commands, which open
    - `uvc_handle_video_abort` calls `pc_hid_start_receive()` (queues a new EP3
      receive) while the driver is being stopped;
    - `usb_ep0_req_recv_on_complete` applies EP0 data without checking
-     `req->returnCode` or the frame index;
+     `req->returnCode`;
    - `uvc_frame_req_submit_phycont` waits for the frame transfer with no
      timeout.
 5. **How VitaShell opens USB transfer** (`usb.c`, `modules/usbdevice/main.c`
@@ -119,7 +114,7 @@ menu (so the plugin doesn't start a new log), copy `ur0:data/VitaSync_log.txt`
 to `ux0:` in VitaShell, then open USB transfer.
 
 ##
-bug when rebooting
-test => ajouter audio
-readme
-no audio cut while recording
+* Rebooting don't work anymore => it stops the console instead
+* Rework readme (add a thank you section at the top to thank the original creator; ...)
+* Modification to let the speakers continue playing audio while a recording is happening
+* Try to fix USB file transfert after recording

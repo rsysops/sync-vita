@@ -15,6 +15,7 @@
 #include "usb_descriptors.h"
 #include "uvc.h"
 #include "audio.h"
+#include "speaker.h"
 
 /* Debug log (make DEBUG=1): lines are buffered and written to
  * ux0:dump/VitaSync_log.txt by DFLUSH(), or by DFLUSH_SAFE() once VitaShell's
@@ -887,10 +888,12 @@ static void pc_hid_send_input_heartbeat(void)
 		audio_heartbeat(&hb[19], &hb[60], &hb[62], &xruns, &hb[18]);
 		hb[59] |= (unsigned char)(xruns << 4);
 	}
-	hb[61] = (unsigned char)((exit_game_request ? 8 : 0) |
+	/* Bits 0-1: the Vita's speaker during sound capture (speaker.h). */
+	hb[61] = (unsigned char)((speaker_state() & 3) |
+	                         (exit_game_request ? 8 : 0) |
 	                         ((kill_result & 3) << 4) |
 	                         ((exit_phase & 3) << 6));
-	hb[63] = 106; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720 */
+	hb[63] = 107; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture */
 
 	ep2_try_send(hb);
 	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;

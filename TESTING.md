@@ -55,9 +55,10 @@ report.
   - the recording says "with sound";
   - `analyze` shows a sound section that isn't "silent all along", and a
     "sound reacts" figure per input; `audio.png` shows the waveform;
-  - if the Vita's speaker volume is up, the user hears it go silent while
-    sound is captured, and come back after `watch stop` (the capture itself
-    doesn't depend on the volume: it's taken before it).
+  - `status` says "Vita speaker: playing the captured sound" (build 107+);
+    if the Vita's volume is up, the user still hears it during the capture,
+    and VOL± still changes its volume (the capture itself doesn't depend on
+    the volume: it's taken before it).
 - **Record:** the levels, the sudden sounds, the reaction times. If the Vita
   had gone to sleep (lock screen, frozen picture, silence), unlock it and
   start the step again.

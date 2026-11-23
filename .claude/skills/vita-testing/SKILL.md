@@ -178,8 +178,10 @@ Tell the user, in a few numbered lines:
    47 frames/s; to measure a 60 fps game, `--size 864x488` (57/s) or
    `480x272` (60/s) instead (`watch stop` first to change size). When sound
    matters (plugin build 101+), add `--audio`: `record` then keeps the sound
-   and `analyze` reports it. The Vita is silent while it's on; tell the user,
-   and `watch stop` gives the sound back. Create the results folder now,
+   and `analyze` reports it. From plugin build 107 the Vita keeps playing its
+   sound meanwhile (`status`: "Vita speaker"); with older builds, or if
+   `status` says muted, it's silent while it's on: tell the user, and
+   `watch stop` gives the sound back. Create the results folder now,
    `DEST=/tmp/<project>-$(date +%Y%m%d-%H%M)`, and save every shot there:
    `$VITACTL shot "$DEST/01-<what>.png"`. Look at each shot before the next
    input.

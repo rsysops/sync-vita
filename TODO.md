@@ -5,6 +5,20 @@
 Sound works since plugin build 101 (`src/audio.c`); `record` corrects the
 sound/picture offset (17 ms, `AUDIO_DELAY_S` in `vitactl.py`). Still to do:
 
+- **Bluetooth headset breaks with sound capture** (since build 101; seen
+  2026-11-23 on build 107). With a Bluetooth headset connected, the capture
+  gets pure silence and the headset sounds distorted; after `watch stop` the
+  headset sounds "monotonous", and once it's disconnected the speaker is
+  distorted too, until a reboot. Likely cause: the Vita feeds Bluetooth by
+  reading the mix in readback mode itself (vitastream's notes: HDMI uses
+  mode 1, readback 2, local outputs 0), and `capture_stream()` always puts
+  path 0 back to mode 0 at stop. Fix: read the mode before taking the route
+  (vitastream reads SrcMix1's mode byte in SceAudio's data, 0xBB28; check
+  its source first), give back that mode at stop, and don't capture at all
+  when the mix is already in readback or HDMI mode (`status` says why).
+  Then, optionally, hook SceAVConfig's set-path-mode during capture (as
+  vitastream does) so a headset connected mid-capture gets its route at
+  stop. Until then: no Bluetooth headset in a boot with sound capture.
 - **Long captures.** 3 minutes showed no drift problem; check 30 minutes or
   more (the ring skips or rebuffers, counted in `status`).
 - **Wake the Vita when the video starts.** A Vita already asleep when
@@ -116,5 +130,4 @@ to `ux0:` in VitaShell, then open USB transfer.
 ##
 * Rebooting don't work anymore => it stops the console instead
 * Rework readme (add a thank you section at the top to thank the original creator; ...)
-* Modification to let the speakers continue playing audio while a recording is happening
 * Try to fix USB file transfert after recording

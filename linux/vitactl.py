@@ -8,7 +8,8 @@ send it buttons, sticks and touches over USB.
                                        shots are always 960x544
              start --audio             also the Vita's sound (plugin build 101+),
                                        kept with the video for `record`; the Vita
-                                       is silent until `watch stop`
+                                       keeps playing it (build 107+; before, or on
+                                       an unknown firmware, silent until `watch stop`)
   vitactl.py press BTN... [ms]         tap buttons (default 150 ms)
   vitactl.py hold BTN... ms            hold buttons
   vitactl.py stick L|R x y ms          move a stick (0-255, 128 = centre)
@@ -1063,6 +1064,11 @@ def cmd_status():
             errors = f"{hb[62] >> 4} failed completions, {hb[62] & 0x0F} failed sends"
         print(f"audio: {', '.join(words) or 'idle'}; last 0.5 s: {hb[60] * 4} packets, "
               f"{errors}, {hb[59] >> 4} underruns/overflows")
+        if build >= 107 and st & 0x08:
+            speaker = {0: "muted", 1: "playing the captured sound",
+                       2: "muted (firmware not recognised)",
+                       3: "muted (playing it failed)"}[hb[61] & 3]
+            print(f"Vita speaker: {speaker}")
 
 
 # ---- dispatch ----

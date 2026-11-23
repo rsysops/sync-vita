@@ -4,6 +4,8 @@ See and hear the PS Vita on a Linux PC **and** control the console (buttons,
 sticks, front and rear touch, PS and volume) over USB, from the command line.
 
 Prototype based on a modified fork of **`vita-udcd-uvc` 1.7** (`xerpi/vita-udcd-uvc`, MIT license).
+Keeping the Vita's speaker on during sound capture uses the technique and
+hardware values found by **vitastream** (`devnoname120/vitastream`, GPL-3.0).
 
 ## What's in it
 
@@ -96,8 +98,11 @@ it was removed (see TODO.md).
 
 **Sound** (plugin build 101+). The Vita is also a USB sound card: Linux lists it
 as `card PSVita` (48 kHz, stereo, 16-bit), carrying the Vita's final mix (games,
-system sounds, music). While the PC has it open, the Vita's own speaker and
-headphones are silent; they come back when it's closed. `watch start --audio`
+system sounds, music). While the PC has it open, the plugin also plays that
+mix on the Vita's own speaker or headphones (build 107+, firmwares 3.60–3.74),
+so the person holding it still hears everything, and the volume buttons still
+work. On a firmware it doesn't recognise, and in builds 101–106, the Vita is
+silent until the PC closes it; `vitactl.py status` says which. `watch start --audio`
 keeps it open for the ring buffer, so `record` saves sound with the video. For a
 plain WAV:
 

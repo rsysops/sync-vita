@@ -9,8 +9,9 @@
  * - the capture thread switches the Vita's final mix (SrcMix1 main, path 0)
  *   to "readback" with the kernel's monitor functions and reads it in blocks
  *   of 512 frames into a ring. Readback takes the mix away from the speaker
- *   and headphones, so the Vita is silent until the PC closes the device
- *   and the normal route is restored.
+ *   and headphones, so the thread also plays each block on them itself
+ *   (speaker.c); on an unknown firmware the Vita is silent until the PC
+ *   closes the device and the normal route is restored.
  * - the USB thread keeps exactly ONE request in flight, carrying 8 packets
  *   (8 ms), refilled from the ring and resubmitted on each completion.
  *   Queueing several requests ahead made SceUdcd fail about half of them,
@@ -35,6 +36,7 @@
 #include <string.h>
 #include "uac.h"
 #include "audio.h"
+#include "speaker.h"
 
 /* ---- USB side ---- */
 #define REQ_PACKETS	8			/* packets per request (8 ms) */
@@ -379,6 +381,7 @@ static void capture_stream(void)
 		goto failed;
 
 restart:
+	speaker_start();	/* on failure the speaker stays muted, capture goes on */
 	cur = 0;
 	discard = SETTLE_BLOCKS;
 	ret = read_block(cur);
@@ -394,15 +397,23 @@ restart:
 		if (ret != 0)
 			goto read_failed;
 		ksceKernelDcacheInvalidateRange(mem->capture[cur], sizeof(mem->capture[cur]));
-		if (discard)
-			discard--;
-		else
+		if (discard) {
+			discard--;	/* Sony's queued blocks may still reach I2S */
+		} else {
 			ring_push((const frame_t *)mem->capture[cur], CAPTURE_FRAMES);
+			/* Then the speaker: done before the next read, while the
+			 * monitor fills buf[next]. */
+			if (speaker_state() == SPEAKER_PLAYING &&
+			    speaker_write(mem->capture[cur]) < 0)
+				speaker_fail();	/* muted; the PC keeps its sound */
+		}
 		cur = next;
 	}
 	goto stop;
 
 read_failed:
+	/* Our transfers stop before the system's playback can resume. */
+	speaker_stop();
 	if (ret == MONITOR_NOT_READBACK && recoveries < MAX_RECOVERIES &&
 	    wanted && !exiting) {
 		/* The system put the normal route back: take it again. */
@@ -415,6 +426,7 @@ read_failed:
 failed:
 	__atomic_fetch_or(&state, ST_FAILED, __ATOMIC_RELAXED);
 stop:
+	speaker_stop();		/* before the normal route comes back */
 	__atomic_fetch_and(&state, ~ST_CAPTURING, __ATOMIC_RELAXED);
 	if (started)
 		mon_read(MONITOR_PATH, NULL, CAPTURE_FRAMES);	/* drain the queued block */
@@ -448,7 +460,6 @@ static int capture_thread(SceSize args, void *argp)
 	return 0;
 }
 
-/* ---- interface ---- */
 /* ---- interface ---- */
 
 int audio_init(SceUdcdEndpoint *ep)

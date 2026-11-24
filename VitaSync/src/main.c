@@ -783,6 +783,54 @@ static int ep2_try_send(const unsigned char *pkt)
 	return r;
 }
 
+/*
+ * Sleep, power off and reboot: no video frame may be pending when the
+ * system takes USB down. Before build 110, a reboot with the cable in hung
+ * for ~20 s and then powered the Vita off whenever the video had been used
+ * in that boot (TODO.md): either frames were still being sent, or, after a
+ * video stop, uvc_thread was stuck waiting on a frame that never went out.
+ * A reboot that never used the video, or with the cable pulled, was fine.
+ *
+ * Build 108 recorded what the kernel sends (2026-11-24): a reboot and a
+ * sleep send the same "going down" events, 0x100, 0x102, ..., 0x202, 0x201,
+ * 0x200, 0x400, then 0x401 every ~10 ms for 3.6 s until USB goes; a wake
+ * sends "resume" events (0x100002, 0x400000). The ids don't tell sleep from
+ * reboot, so this does the same for both: on each "going down" event, stop
+ * the video, cancel the frame request and release uvc_thread if it waits
+ * on one; on "resume", streaming may start again. No waiting here, no file
+ * IO (the debug build that waited 500 ms here blocked the shutdown for
+ * good). The events repeat, which covers a frame queued between two.
+ */
+int ksceKernelUnregisterSysEventHandler(SceUID uid);	/* in the stub, not the header */
+
+static SceUID sysevent_uid = -1;
+static volatile int going_down;	/* between a "going down" event and a resume */
+/* Set while uvc_thread waits for a frame transfer to complete (TODO.md:
+ * after a video stop it can wait there forever). */
+static volatile int uvc_frame_waiting;
+/* Set from just before a frame request is queued until it completes. */
+static volatile int uvc_frame_pending;
+
+static int sysevent_handler(int resume, int eventid, void *args, void *opt)
+{
+	(void)eventid;
+	(void)args;
+	(void)opt;
+	if (resume) {
+		going_down = 0;
+	} else {
+		going_down = 1;		/* uvc_thread sends no more frames */
+		stream = 0;
+		/* Each repeated event cancels again while the frame hasn't
+		 * completed (a cancel may not call its completion). */
+		if (uvc_frame_pending || uvc_frame_waiting) {
+			ksceUdcdReqCancelAll(&endpoints[1]);
+			ksceKernelSetEventFlag(uvc_frame_req_evflag, 1);
+		}
+	}
+	return 0;
+}
+
 static void pc_hid_send_input_heartbeat(void)
 {
 	static unsigned char hb[PC_HID_REPORT_SIZE] __attribute__((aligned(64)));
@@ -893,7 +941,7 @@ static void pc_hid_send_input_heartbeat(void)
 	                         (exit_game_request ? 8 : 0) |
 	                         ((kill_result & 3) << 4) |
 	                         ((exit_phase & 3) << 6));
-	hb[63] = 107; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture */
+	hb[63] = 110; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture, 108 system event probe (test only), 109 = probe + 110's fix (test only), 110 no video frame pending at sleep/reboot */
 
 	ep2_try_send(hb);
 	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;
@@ -981,6 +1029,7 @@ static int uvc_frame_req_fini(void)
 
 static void uvc_frame_req_submit_phycont_on_complete(SceUdcdDeviceRequest *req)
 {
+	uvc_frame_pending = 0;
 	ksceKernelSetEventFlag(uvc_frame_req_evflag, 1);
 }
 
@@ -1003,13 +1052,22 @@ static int uvc_frame_req_submit_phycont(const void *data, unsigned int size)
 		.physicalAddress = NULL
 	};
 
+	/* Not once the system is going down (sysevent_handler). Pending is
+	 * set first, so the handler can't miss a frame being queued. */
+	if (going_down)
+		return 0;
+	uvc_frame_pending = 1;
 	ret = ksceUdcdReqSend(&req);
-	if (ret < 0)
+	if (ret < 0) {
+		uvc_frame_pending = 0;
 		return ret;
+	}
 
 	BC(bc_uvc_where, 5);
+	uvc_frame_waiting = 1;
 	ret = ksceKernelWaitEventFlagCB(uvc_frame_req_evflag, 1, SCE_EVENT_WAITOR |
 					SCE_EVENT_WAITCLEAR_PAT, NULL, NULL);
+	uvc_frame_waiting = 0;
 	BC(bc_uvc_where, 6);
 
 	return ret;
@@ -1793,8 +1851,9 @@ static int uvc_thread(SceSize args, void *argp)
 		 * Opening it stops every udcd driver (ours too) and MTP, and
 		 * closing it restarts only MTP. So "ours evicted + MTP back"
 		 * can only mean it has closed. */
+		/* Not while the system takes USB down for a sleep or reboot. */
 		if (usb_states_known && usb_retake_fails < USB_RETAKE_MAX_FAILS &&
-		    now >= next_usb_check) {
+		    !going_down && now >= next_usb_check) {
 			next_usb_check = now + USB_CHECK_INTERVAL_US;
 #ifdef DEBUG
 			{
@@ -1929,7 +1988,7 @@ static int uvc_thread(SceSize args, void *argp)
 		if (kill_hold > 0)
 			kill_hold--;
 
-		if (ret == 0 && stream && kill_hold == 0) {
+		if (ret == 0 && stream && kill_hold == 0 && !going_down) {
 			BC(bc_uvc_where, 3);
 			int sf = send_frame();
 			BC(bc_uvc_where, 4);
@@ -2254,6 +2313,8 @@ int module_start(SceSize argc, const void *args)
 	if (dbg_logger_id >= 0)
 		ksceKernelStartThread(dbg_logger_id, 0, NULL);
 #endif
+	sysevent_uid = DCALL(ksceKernelRegisterSysEventHandler("vitasync_sysevent",
+							       sysevent_handler, NULL));
 
 	SceUdcd_modinfo.size = sizeof(SceUdcd_modinfo);
 	DCALL(taiGetModuleInfoForKernel(KERNEL_PID, "SceUdcd", &SceUdcd_modinfo));
@@ -2318,6 +2379,10 @@ err_return:
 
 int module_stop(SceSize argc, const void *args)
 {
+	if (sysevent_uid >= 0) {
+		ksceKernelUnregisterSysEventHandler(sysevent_uid);
+		sysevent_uid = -1;
+	}
 #ifdef DEBUG
 	if (dbg_logger_id >= 0) {
 		dbg_logger_run = 0;

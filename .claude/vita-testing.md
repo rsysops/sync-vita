@@ -45,8 +45,8 @@ Copy the `.skprx` to `downloads/`. The user then:
 
 The plugin takes over USB about 40 s after that (`lsusb`: `054c:1337`, video
 on the `/dev/video*` named "PSVita", HID on a `/dev/hidraw*`). With the
-release build, `vitactl.py status` shows the build number (107 as of
-2026-11-23).
+release build, `vitactl.py status` shows the build number (110 as of
+2026-11-24).
 
 Opening VitaShell's USB transfer stops the plugin. Closing it brings the plugin
 back by itself within a few seconds (`1337` again), with no reboot needed.

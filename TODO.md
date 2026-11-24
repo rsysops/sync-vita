@@ -39,16 +39,46 @@ the build that hid audio in the frames). Experimental builds 102-104
 - **A 250 ms limit on the frame send's wait, cancelling the request on
   timeout from uvc_thread** (103): worse, a single stop led to a freeze and
   a crash.
-- **Even on 101/105, uvc_thread seems to stall after a video stop**: no
-  heartbeat until the video restarts (`uvc_frame_req_submit_phycont` waits
-  for its completion with no limit; a frame queued just after the PC stops
-  reading never completes). With the 2 ms wait this stays harmless (10
-  stop/starts in a row fine on 105), and the next start unblocks it.
+- **uvc_thread stalls after a video stop** (confirmed 2026-11-24 with probe
+  build 108: the heartbeat stops the moment `watch stop` runs and comes
+  back only on the next start, a reboot, or an unplug).
+  `uvc_frame_req_submit_phycont` waits for its completion with no limit,
+  and a frame queued just after the PC stops reading never completes. With
+  the 2 ms wait this stays harmless (10 stop/starts in a row fine on 105),
+  and the next start unblocks it. It also made a reboot hang and power the
+  Vita off (until build 110, see below). And PC input does nothing in the
+  meantime: `pc_control_apply` and the heartbeat run in uvc_thread, so after
+  a `watch stop` a `press` is lost until the next `watch start` (seen
+  2026-11-24 on build 110). Input in a boot where the video never ran works.
 
-Next: debug build (breadcrumbs: `bc_uvc_where`) to see where uvc_thread is
-after a stop, then make the frame path stop cleanly (check `stream` before
-each submit, release the wait from the abort path) before removing the wait
-again.
+**Fixed in build 110: reboot after the video was used.** Before, with the
+cable in, VitaDeploy > Reboot hung ~20 s and then powered the Vita off
+whenever `watch` had run in that boot (running or stopped). A boot without
+video, or a reboot with the cable pulled, was fine. Build 110 has a system
+event handler (`sysevent_handler` in `main.c`): before a sleep or reboot it
+stops the video, cancels the pending frame and releases uvc_thread. Build
+108 found that a reboot and a sleep send the same events, so the handler
+can't tell them apart. Notes: the cancel doesn't call the frame's
+completion. Waiting or writing files in that handler blocks the shutdown
+for good (a debug build that waited 500 ms there did). Debug builds can't
+be used to study a shutdown: their logger goes quiet ~60 s after the PC
+connects, and the shutdown then hangs too.
+
+Next: make a normal video stop clean the same way (check `stream` before
+each submit, cancel and release the wait from the abort path) before
+removing the 2 ms wait again. 103's crash came from cancelling on a timeout
+in uvc_thread, during streaming; the handler cancels from another thread,
+once nothing more is sent, which works.
+
+## Video: the Vita won't sleep during a capture
+
+With `watch` running, a short press on the power button doesn't put the
+Vita to sleep: the PS button stays blue and the capture goes on after
+unlocking (seen 2026-11-24 on build 109). The system refuses before sending
+any sleep event, so the plugin's handler never runs. Not investigated;
+likely the keep-awake ticks in uvc_thread (`ksceKernelPowerTick` every
+10 s while streaming) or the USB traffic itself. Harmless: `watch stop`
+first to put the Vita to sleep.
 
 ## VitaShell's USB transfer freezes the Vita after the PC used the HID interface
 
@@ -128,6 +158,5 @@ menu (so the plugin doesn't start a new log), copy `ur0:data/VitaSync_log.txt`
 to `ux0:` in VitaShell, then open USB transfer.
 
 ##
-* Rebooting don't work anymore => it stops the console instead
 * Rework readme (add a thank you section at the top to thank the original creator; ...)
 * Try to fix USB file transfert after recording

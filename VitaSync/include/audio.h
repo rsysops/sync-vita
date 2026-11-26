@@ -16,6 +16,10 @@ void audio_fini(void);
  * interface, or the cable went away (on = 0). Safe in USB callbacks. */
 void audio_set_streaming(int on);
 
+/* No audio request is queued on USB (none sent, or the last one came
+ * back). Safe from any thread. */
+int audio_idle(void);
+
 /* Heartbeat fields, counted since the last call (~500 ms):
  * state: 1 PC wants sound, 2 streaming, 4 ready, 8 capturing the Vita's
  *        mix, 16 route taken back after a reset, 32 monitor functions not

@@ -17,6 +17,13 @@ ifeq ($(DEBUG), 1)
 	LIBS	+= -lSceIofilemgrForDriver_stub
 endif
 
+# Test only: logs every USB start/stop/activate/deactivate call, with how
+# long it took, to ur0:data/VitaSync_probe.txt (see USB_PROBE in main.c).
+ifeq ($(PROBE), 1)
+	CFLAGS	+= -DUSB_PROBE
+	LIBS	+= -lSceIofilemgrForDriver_stub
+endif
+
 ifeq ($(DISPLAY_OFF_OLED), 1)
 	CFLAGS	+= -DDISPLAY_OFF_OLED
 	LIBS	+= -lSceOledForDriver_stub

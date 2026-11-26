@@ -560,6 +560,11 @@ void audio_set_streaming(int on)
 		ksceKernelSetEventFlag(cap_ev_id, EV_WAKE);
 }
 
+int audio_idle(void)
+{
+	return !__atomic_load_n(&owned, __ATOMIC_SEQ_CST);
+}
+
 static unsigned char take(volatile unsigned int *c, unsigned int div, unsigned int max)
 {
 	unsigned int v = __atomic_exchange_n(c, 0, __ATOMIC_RELAXED) / div;

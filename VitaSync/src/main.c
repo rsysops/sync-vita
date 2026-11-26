@@ -57,6 +57,18 @@ struct bc_ep0_req {
 static struct bc_ep0_req bc_ep0_ring[BC_EP0_RING];
 static volatile unsigned int bc_ep0_head;
 #define BC(var, v)	((var) = (v))
+#elif defined(USB_PROBE)
+/* Probe builds keep only where uvc_thread is (written by the probe's
+ * status thread); the other breadcrumbs cost nothing. */
+static volatile unsigned int bc_uvc_where;
+#define BC(var, v)		BC_##var(v)
+#define BC_bc_uvc_where(v)	(bc_uvc_where = (v))
+#define BC_bc_attach_step(v)	((void)0)
+#define BC_bc_detach_step(v)	((void)0)
+#define BC_bc_abort_n(v)	((void)0)
+#define BC_bc_abort_step(v)	((void)0)
+#define BC_bc_ep3_done_n(v)	((void)0)
+#define BC_bc_ep3_last_rc(v)	((void)0)
 #else
 #define BC(var, v)	((void)0)
 #endif
@@ -145,7 +157,13 @@ static struct {
 static SceUID uvc_thread_id;
 static SceUID uvc_event_flag_id;
 static int uvc_thread_run;
-static int stream;
+/* Set from USB callbacks and hooks, read by uvc_thread. */
+static volatile int stream;
+/* Set when something is about to take USB from us (VitaShell's USB
+ * transfer, see usb_yield), cleared when we take it back (usb_retake).
+ * While set, nothing of ours goes out on USB and our driver answers no
+ * request. */
+static volatile int usb_yielded;
 
 static SceUID uvc_frame_buffer_uid = -1;
 static struct uvc_frame *uvc_frame_buffer_addr;
@@ -690,7 +708,11 @@ static void pc_hid_recv_on_complete(SceUdcdDeviceRequest *req)
 	}
 
 	/* Always re-arm, even after an error: a single bad transfer must
-	 * not kill the control channel permanently. */
+	 * not kill the control channel permanently. Except once USB is being
+	 * given away: the cancel lands here, and a new request would be left
+	 * behind for whoever takes USB. Attach arms it again. */
+	if (usb_yielded)
+		return;
 	memset(pc_hid_report, 0, sizeof(pc_hid_report));
 	pc_hid_report[0] = PC_HID_REPORT_ID_OUTPUT;
 	ksceKernelDcacheCleanInvalidateRange(pc_hid_report, sizeof(pc_hid_report));
@@ -811,6 +833,25 @@ static volatile int uvc_frame_waiting;
 /* Set from just before a frame request is queued until it completes. */
 static volatile int uvc_frame_pending;
 
+/* Cancel the frame request still queued, if any, and let uvc_thread go on
+ * if it waits for it. The caller has set stream = 0 (or going_down, or
+ * usb_yielded) first, so uvc_frame_req_submit_phycont queues no new one.
+ * Without this, a frame queued just as the PC stops reading never
+ * completes: uvc_thread waits forever, and whoever stops USB next (a
+ * reboot, VitaShell's USB transfer) hangs on it. Called from other threads
+ * than uvc_thread (the 103 crash came from cancelling in uvc_thread while
+ * streaming). No waiting, no file IO. */
+static void uvc_frame_release(void)
+{
+	__sync_synchronize();
+	if (uvc_frame_pending || uvc_frame_waiting) {
+		ksceUdcdReqCancelAll(&endpoints[1]);
+		/* A cancel may not call the completion. */
+		uvc_frame_pending = 0;
+		ksceKernelSetEventFlag(uvc_frame_req_evflag, 1);
+	}
+}
+
 static int sysevent_handler(int resume, int eventid, void *args, void *opt)
 {
 	(void)eventid;
@@ -822,11 +863,8 @@ static int sysevent_handler(int resume, int eventid, void *args, void *opt)
 		going_down = 1;		/* uvc_thread sends no more frames */
 		stream = 0;
 		/* Each repeated event cancels again while the frame hasn't
-		 * completed (a cancel may not call its completion). */
-		if (uvc_frame_pending || uvc_frame_waiting) {
-			ksceUdcdReqCancelAll(&endpoints[1]);
-			ksceKernelSetEventFlag(uvc_frame_req_evflag, 1);
-		}
+		 * completed. */
+		uvc_frame_release();
 	}
 	return 0;
 }
@@ -941,7 +979,13 @@ static void pc_hid_send_input_heartbeat(void)
 	                         (exit_game_request ? 8 : 0) |
 	                         ((kill_result & 3) << 4) |
 	                         ((exit_phase & 3) << 6));
-	hb[63] = 110; /* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture, 108 system event probe (test only), 109 = probe + 110's fix (test only), 110 no video frame pending at sleep/reboot */
+	hb[63] =
+#ifdef USB_PROBE
+		112;
+#else
+		111;
+#endif
+	/* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture, 108 system event probe (test only), 109 = probe + 110's fix (test only), 110 no video frame pending at sleep/reboot, 111 steps aside for VitaShell's USB transfer (StopCurrentInternal hook), frame released at video stop, 112 = 111 + USB probe (test only) */
 
 	ep2_try_send(hb);
 	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;
@@ -1052,11 +1096,27 @@ static int uvc_frame_req_submit_phycont(const void *data, unsigned int size)
 		.physicalAddress = NULL
 	};
 
-	/* Not once the system is going down (sysevent_handler). Pending is
-	 * set first, so the handler can't miss a frame being queued. */
-	if (going_down)
-		return 0;
+	/* Not once the video has stopped, the system is going down
+	 * (sysevent_handler) or USB is being given away (usb_yield). Pending
+	 * is set before the check and the stoppers clear stream before
+	 * testing pending (uvc_frame_release), so either we see the stop or
+	 * they see this frame. */
 	uvc_frame_pending = 1;
+	__sync_synchronize();
+	if (!stream || going_down || usb_yielded) {
+		uvc_frame_pending = 0;
+		return 0;
+	}
+	/* A release while nothing waited leaves the flag set: it must not
+	 * end this frame's wait early. (A poll that clears what it finds;
+	 * it fails harmlessly when the flag isn't set.) */
+	{
+		unsigned int stale;
+
+		ksceKernelPollEventFlag(uvc_frame_req_evflag, 1,
+					SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
+					&stale);
+	}
 	ret = ksceUdcdReqSend(&req);
 	if (ret < 0) {
 		uvc_frame_pending = 0;
@@ -1185,18 +1245,18 @@ static void uvc_handle_video_abort(void)
 		stream = 0;
 
 		ksceUdcdClearFIFO(&endpoints[1]);
-	ksceUdcdClearFIFO(&endpoints[2]);
-	ksceUdcdClearFIFO(&endpoints[3]);
 		BC(bc_abort_step, 2);
-	pc_control_release();
+		pc_control_release();
 		BC(bc_abort_step, 3);
-	pc_hid_start_receive();
-		BC(bc_abort_step, 4);
-		ksceUdcdReqCancelAll(&endpoints[1]);
-		BC(bc_abort_step, 5);
+		/* HID is left alone: the EP3 receive is still queued and
+		 * re-arms itself. Queuing it again here (as before build 111)
+		 * put the same request on EP3 twice. */
 		exit_phase = 0;
 		kill_hold = 0;
 	}
+	/* Even when stream was already 0: after a video stop the last frame
+	 * can stay queued, with uvc_thread waiting on it. */
+	uvc_frame_release();
 	BC(bc_abort_step, 9);
 }
 
@@ -1220,9 +1280,22 @@ static void uvc_handle_clear_feature(const SceUdcdEP0DeviceRequest *req)
 	}
 }
 
+static volatile int usb_driver_running;	/* defined with uvc_driver_start */
+#ifdef USB_PROBE
+/* Callback counts, for the probe's lines (no file IO in callbacks). */
+static volatile unsigned int probe_attach_n, probe_detach_n;
+static volatile unsigned int probe_drv_start_n, probe_drv_stop_n;
+#endif
+
 static int uvc_udcd_process_request(int recipient, int arg, SceUdcdEP0DeviceRequest *req, void *user_data)
 {
 	if (arg < 0)
+		return -1;
+	/* udcd keeps calling us after VitaShell's USB transfer has replaced
+	 * our device. We used to take its storage class request GET_MAX_LUN
+	 * (0xA1 0xFE, interface 0) for one of ours and answer nothing: the PC
+	 * waited 10 s before mounting (usbmon, 2026-11-25). */
+	if (usb_yielded || !usb_driver_running)
 		return -1;
 
 #ifdef DEBUG
@@ -1362,6 +1435,9 @@ static volatile int dbg_attach_usb_version;
 
 static int uvc_udcd_attach(int usb_version, void *user_data)
 {
+#ifdef USB_PROBE
+	probe_attach_n++;
+#endif
 #ifdef DEBUG
 	dbg_attach_usb_version = usb_version;
 	dbg_attach_n++;
@@ -1394,6 +1470,9 @@ static int uvc_udcd_attach(int usb_version, void *user_data)
 
 static void uvc_udcd_detach(void *user_data)
 {
+#ifdef USB_PROBE
+	probe_detach_n++;
+#endif
 #ifdef DEBUG
 	dbg_detach_n++;
 #endif
@@ -1421,8 +1500,8 @@ static void uvc_udcd_configure(int usb_version, int desc_count, SceUdcdInterface
 
 /* udcd calls these when our driver is started or stopped, including when
  * VitaShell's USB transfer stops every driver as it opens. One of the two
- * signals the retake check in uvc_thread relies on. */
-static volatile int usb_driver_running;
+ * signals the retake check in uvc_thread relies on. (usb_driver_running is
+ * declared above uvc_udcd_process_request.) */
 #ifdef DEBUG
 static volatile unsigned int dbg_drv_start_n, dbg_drv_stop_n;
 #endif
@@ -1430,6 +1509,9 @@ static volatile unsigned int dbg_drv_start_n, dbg_drv_stop_n;
 static int uvc_driver_start(int size, void *p, void *user_data)
 {
 	usb_driver_running = 1;
+#ifdef USB_PROBE
+	probe_drv_start_n++;
+#endif
 #ifdef DEBUG
 	dbg_drv_start_n++;
 #endif
@@ -1439,6 +1521,11 @@ static int uvc_driver_start(int size, void *p, void *user_data)
 static int uvc_driver_stop(int size, void *p, void *user_data)
 {
 	usb_driver_running = 0;
+#ifdef USB_PROBE
+	probe_drv_stop_n++;
+#endif
+	stream = 0;
+	uvc_frame_release();
 #ifdef DEBUG
 	dbg_drv_stop_n++;
 #endif
@@ -1731,6 +1818,349 @@ static int usb_mtp_restarted(void)
 	return st >= 0 && st != usb_mtp_stopped_state;
 }
 
+/*
+ * Stepping aside for VitaShell's USB transfer (build 111).
+ *
+ * VitaShell (also VitaDeploy's File Manager) opens USB transfer by loading
+ * its usbdevice.skprx, whose module_start calls
+ * ksceUdcdStopCurrentInternal(2) to stop the current USB drivers, ours
+ * included; then it stops MTP and starts its storage device (05d3). Before
+ * build 111 it stopped us in whatever state we were in: after a video stop
+ * a frame request stayed queued forever, and the Vita froze there.
+ *
+ * Our hook on ksceUdcdStopCurrentInternal runs first, in the caller's
+ * thread. It stops everything we send and cancels everything we have
+ * queued, waits (200 ms at most) for uvc_thread to leave a frame or
+ * heartbeat it may be in the middle of, then lets the call go on. From then
+ * on we queue nothing and answer no request (usb_yielded), until
+ * usb_retake takes USB back after VitaShell's transfer closes.
+ */
+static SceUID udcd_stop_current_hook_uid = -1;
+static tai_hook_ref_t udcd_stop_current_ref;
+/* Set by uvc_thread while it may queue something on USB (a frame or a
+ * heartbeat), after checking usb_yielded. */
+static volatile int uvc_busy;
+#ifdef DEBUG
+static volatile unsigned int dbg_yield_n, dbg_yield_wait_ms, dbg_unyield_n;
+#endif
+
+#define USB_YIELD_WAIT_MS	200
+
+#ifdef USB_PROBE
+/*
+ * USB probe (make PROBE=1, test only, build id 112). Build 111 still froze
+ * once for 30-60 s when USB transfer opened after video + input, then
+ * VitaShell came back without USB transfer. Every udcd start, stop,
+ * activate and deactivate (ours, VitaShell's, VStor's, MTP's) is written
+ * to ur0:data/VitaSync_probe.txt with its duration and our state, synced
+ * at once so a forced power-off keeps it. Not while the system goes down
+ * (file IO blocks a shutdown, build 110).
+ */
+#include <psp2kern/io/fcntl.h>
+#include <psp2kern/io/stat.h>
+#include <stdio.h>
+
+#define PROBE_FILE	"ur0:data/VitaSync_probe.txt"
+
+#define PROBE_HOOKS	7
+static SceUID probe_hook_uid[PROBE_HOOKS] = { -1, -1, -1, -1, -1, -1, -1 };
+static tai_hook_ref_t probe_ref[PROBE_HOOKS];
+static SceUID probe_thread_id = -1;
+static volatile int probe_run;
+/* Device state reads since the last status line, from VitaShell
+ * (sceUdcdGetDeviceState) and from the kernel (Internal). */
+static volatile unsigned int probe_state_user_n, probe_state_kernel_n;
+
+static void probe_write(const char *buf, int len, int truncate)
+{
+	SceUID fd;
+	int st;
+
+	ksceIoMkdir("ur0:data", 6);
+	fd = ksceIoOpen(PROBE_FILE, SCE_O_WRONLY | SCE_O_CREAT |
+			(truncate ? SCE_O_TRUNC : SCE_O_APPEND), 6);
+	if (fd < 0)
+		return;
+	ksceIoWrite(fd, buf, len);
+	ksceIoSyncByFd(fd, &st);
+	ksceIoClose(fd);
+}
+
+/* Time in ms since boot, then the line, then our state. */
+#define PROBE(...) do { \
+	if (!going_down) { \
+		char b__[256]; \
+		int n__ = snprintf(b__, sizeof(b__), "%8u ", \
+			(unsigned int)(ksceKernelGetSystemTimeWide() / 1000)); \
+		n__ += snprintf(b__ + n__, sizeof(b__) - n__, __VA_ARGS__); \
+		n__ += snprintf(b__ + n__, sizeof(b__) - n__, \
+			" | busy %d wait %d pend %d stream %d yielded %d " \
+			"running %d ctrl %d audio_idle %d ep2 %d | attach %u " \
+			"detach %u drvstart %u drvstop %u\n", \
+			uvc_busy, uvc_frame_waiting, uvc_frame_pending, stream, \
+			usb_yielded, usb_driver_running, pc_control_active, \
+			audio_idle(), ep2_busy, probe_attach_n, probe_detach_n, \
+			probe_drv_start_n, probe_drv_stop_n); \
+		if (n__ > (int)sizeof(b__) - 1) \
+			n__ = sizeof(b__) - 1; \
+		probe_write(b__, n__, 0); \
+	} \
+} while (0)
+
+/* The original (or the next hook in the chain), as the hooks above do. */
+#define PROBE_NEXT(i, type) \
+	(((struct _tai_hook_user *)probe_ref[i])->next ? \
+	 (type)((struct _tai_hook_user *)((struct _tai_hook_user *)probe_ref[i])->next)->func : \
+	 (type)((struct _tai_hook_user *)probe_ref[i])->old)
+
+static int probe_start(const char *name, int size, void *args, int bus)
+{
+	SceUInt64 t = ksceKernelGetSystemTimeWide();
+	int ret;
+
+	PROBE("> StartInternal(%s, bus %d)", name ? name : "?", bus);
+	ret = PROBE_NEXT(0, int (*)(const char *, int, void *, int))(name, size, args, bus);
+	PROBE("< StartInternal(%s) = 0x%08X in %u ms", name ? name : "?", ret,
+	      (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000));
+	return ret;
+}
+
+static int probe_stop(const char *name, int size, void *args, int bus)
+{
+	SceUInt64 t = ksceKernelGetSystemTimeWide();
+	int ret;
+
+	PROBE("> StopInternal(%s, bus %d)", name ? name : "?", bus);
+	ret = PROBE_NEXT(1, int (*)(const char *, int, void *, int))(name, size, args, bus);
+	PROBE("< StopInternal(%s) = 0x%08X in %u ms", name ? name : "?", ret,
+	      (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000));
+	return ret;
+}
+
+static int probe_activate(unsigned int pid, unsigned int bus_powered, int bus)
+{
+	SceUInt64 t = ksceKernelGetSystemTimeWide();
+	int ret;
+
+	PROBE("> ActivateInternal(0x%04X, bus %d)", pid, bus);
+	ret = PROBE_NEXT(2, int (*)(unsigned int, unsigned int, int))(pid, bus_powered, bus);
+	PROBE("< ActivateInternal(0x%04X) = 0x%08X in %u ms", pid, ret,
+	      (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000));
+	return ret;
+}
+
+static int probe_deactivate(int bus)
+{
+	SceUInt64 t = ksceKernelGetSystemTimeWide();
+	int ret;
+
+	PROBE("> DeactivateInternal(bus %d)", bus);
+	ret = PROBE_NEXT(3, int (*)(int))(bus);
+	PROBE("< DeactivateInternal = 0x%08X in %u ms", ret,
+	      (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000));
+	return ret;
+}
+
+static int probe_start_current(int unused, int bus)
+{
+	SceUInt64 t = ksceKernelGetSystemTimeWide();
+	int ret;
+
+	PROBE("> StartCurrentInternal(bus %d)", bus);
+	ret = PROBE_NEXT(4, int (*)(int, int))(unused, bus);
+	PROBE("< StartCurrentInternal = 0x%08X in %u ms", ret,
+	      (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000));
+	return ret;
+}
+
+/* VitaShell checks the cable with this before starting USB transfer, and
+ * polls it while USB transfer is open. Logged when slower than 50 ms. */
+static int probe_state_user(void *state)
+{
+	SceUInt64 t = ksceKernelGetSystemTimeWide();
+	unsigned int ms;
+	int ret;
+
+	probe_state_user_n++;
+	ret = PROBE_NEXT(5, int (*)(void *))(state);
+	ms = (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000);
+	if (ms > 50)
+		PROBE("  sceUdcdGetDeviceState (VitaShell) = 0x%08X took %u ms",
+		      ret, ms);
+	return ret;
+}
+
+static int probe_state_kernel(int bus)
+{
+	SceUInt64 t = ksceKernelGetSystemTimeWide();
+	unsigned int ms;
+	int ret;
+
+	probe_state_kernel_n++;
+	ret = PROBE_NEXT(6, int (*)(int))(bus);
+	ms = (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000);
+	if (ms > 50)
+		PROBE("  GetDeviceStateInternal(bus %d) = 0x%08X took %u ms",
+		      bus, ret, ms);
+	return ret;
+}
+
+/* A status line each second while anything in it changes, else every
+ * 10 s: where uvc_thread is (1 waits for a vblank, 3 sends a frame, 5
+ * waits for a frame to complete, 6 frame done, 7-8 retake), the buttons
+ * the kernel sees, and how often the device state was read. */
+static int probe_thread(SceSize args, void *argp)
+{
+	unsigned int last[6] = { ~0u, ~0u, ~0u, ~0u, ~0u, ~0u };
+	int ticks = 0;
+
+	(void)args; (void)argp;
+	while (probe_run) {
+		SceCtrlData pad;
+		unsigned int now[6];
+
+		memset(&pad, 0, sizeof(pad));
+		ksceCtrlPeekBufferPositive(0, &pad, 1);
+		now[0] = bc_uvc_where;
+		now[1] = pad.buttons;
+		now[2] = (stream << 0) | (usb_yielded << 1) |
+			 (usb_driver_running << 2) | (pc_control_active << 3) |
+			 (uvc_busy << 4) | (uvc_frame_waiting << 5);
+		now[3] = probe_attach_n + probe_detach_n * 256;
+		now[4] = probe_state_user_n ? 1 : 0;
+		now[5] = probe_drv_start_n + probe_drv_stop_n * 256;
+		if (memcmp(now, last, sizeof(now)) != 0 || ++ticks >= 10) {
+			PROBE("tick: uvc_thread at %u, buttons 0x%08X, state reads "
+			      "%u user %u kernel", now[0], now[1],
+			      probe_state_user_n, probe_state_kernel_n);
+			probe_state_user_n = 0;
+			probe_state_kernel_n = 0;
+			memcpy(last, now, sizeof(now));
+			ticks = 0;
+		}
+		ksceKernelDelayThread(1000000);
+	}
+	return 0;
+}
+
+static void probe_install(void)
+{
+	static const struct { unsigned int lib, nid; void *func; } h[PROBE_HOOKS] = {
+		{ 0xBC05A8FB, 0x90F8BCAE, probe_start },	/* ksceUdcdStartInternal */
+		{ 0xBC05A8FB, 0x150FD3BB, probe_stop },		/* ksceUdcdStopInternal */
+		{ 0xBC05A8FB, 0x9119247B, probe_activate },	/* ksceUdcdActivateInternal */
+		{ 0xBC05A8FB, 0xFDC10F93, probe_deactivate },	/* ksceUdcdDeactivateInternal */
+		{ 0xBC05A8FB, 0x360E95B9, probe_start_current },/* ksceUdcdStartCurrentInternal */
+		{ 0xA84BDE8A, 0xFCD31220, probe_state_user },	/* sceUdcdGetDeviceState (syscall) */
+		{ 0xBC05A8FB, 0x409DD196, probe_state_kernel },	/* ksceUdcdGetDeviceStateInternal */
+	};
+	char line[200];
+	int i, n;
+
+	for (i = 0; i < PROBE_HOOKS; i++)
+		probe_hook_uid[i] = taiHookFunctionExportForKernel(KERNEL_PID,
+			&probe_ref[i], "SceUdcd", h[i].lib, h[i].nid, h[i].func);
+	n = snprintf(line, sizeof(line), "%8u probe build 112: hooks 0x%08X 0x%08X "
+		     "0x%08X 0x%08X 0x%08X 0x%08X 0x%08X\n",
+		     (unsigned int)(ksceKernelGetSystemTimeWide() / 1000),
+		     probe_hook_uid[0], probe_hook_uid[1], probe_hook_uid[2],
+		     probe_hook_uid[3], probe_hook_uid[4], probe_hook_uid[5],
+		     probe_hook_uid[6]);
+	probe_write(line, n, 1);
+
+	probe_run = 1;
+	probe_thread_id = ksceKernelCreateThread("vitasync_probe", probe_thread,
+						 0x40, 0x2000, 0, 0x10000, 0);
+	if (probe_thread_id >= 0)
+		ksceKernelStartThread(probe_thread_id, 0, NULL);
+}
+
+static void probe_remove(void)
+{
+	int i;
+
+	if (probe_thread_id >= 0) {
+		probe_run = 0;
+		ksceKernelWaitThreadEnd(probe_thread_id, NULL, NULL);
+		ksceKernelDeleteThread(probe_thread_id);
+		probe_thread_id = -1;
+	}
+	for (i = 0; i < PROBE_HOOKS; i++)
+		if (probe_hook_uid[i] > 0)
+			taiHookReleaseForKernel(probe_hook_uid[i], probe_ref[i]);
+}
+#else
+#define PROBE(...)	((void)0)
+#endif
+
+static void usb_yield(void)
+{
+	int ms;
+
+	usb_yielded = 1;
+	stream = 0;
+	audio_set_streaming(0);
+	pc_control_release();
+	/* Lets uvc_thread out if it waits for a frame (with the barrier
+	 * that pairs with its uvc_busy). */
+	uvc_frame_release();
+	PROBE("  yield: stopped sending, frame released");
+
+	for (ms = 0; ms < USB_YIELD_WAIT_MS && (uvc_busy || !audio_idle()); ms++)
+		ksceKernelDelayThread(1000);
+	PROBE("  yield: waited %d ms", ms);
+#ifdef DEBUG
+	dbg_yield_n++;
+	dbg_yield_wait_ms = ms;
+#endif
+
+	/* Nothing of ours is being queued any more: cancel what is left.
+	 * EP1 again for a frame queued in the instant before the stop. The
+	 * EP3 cancel doesn't re-arm (pc_hid_recv_on_complete). */
+	ksceUdcdReqCancelAll(&endpoints[1]);
+	uvc_frame_pending = 0;
+	ksceKernelSetEventFlag(uvc_frame_req_evflag, 1);
+	ksceUdcdReqCancelAll(&endpoints[2]);
+	ep2_busy = 0;
+	ksceUdcdReqCancelAll(&endpoints[3]);
+	ksceUdcdReqCancelAll(&endpoints[4]);
+	PROBE("  yield: all requests cancelled");
+}
+
+static int udcd_stop_current_hook(int bus)
+{
+	int ret;
+#ifdef USB_PROBE
+	SceUInt64 t = ksceKernelGetSystemTimeWide();
+#endif
+
+	PROBE("> StopCurrentInternal(bus %d)", bus);
+	usb_yield();
+	/* TAI_CONTINUE by hand: its (int (*)()) cast means "no arguments"
+	 * to this compiler (same as the descriptor hook). */
+	{
+		struct _tai_hook_user *cur =
+			(struct _tai_hook_user *)udcd_stop_current_ref;
+		struct _tai_hook_user *nxt =
+			(struct _tai_hook_user *)cur->next;
+
+		ret = nxt ? ((int (*)(int))nxt->func)(bus)
+			  : ((int (*)(int))cur->old)(bus);
+	}
+	PROBE("< StopCurrentInternal = 0x%08X in %u ms", ret,
+	      (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000));
+	/* If that didn't stop our driver after all, carry on: arm the HID
+	 * receive again (attach won't, nothing reconnects). */
+	if (usb_driver_running) {
+		usb_yielded = 0;
+		pc_hid_start_receive();
+#ifdef DEBUG
+		dbg_unyield_n++;
+#endif
+	}
+	return ret;
+}
+
 /* The debug log is on ur0:, which VitaShell's USB transfer never hands to
  * the PC, so it can be written at any time. */
 #define DFLUSH_SAFE()	DFLUSH()
@@ -1753,9 +2183,13 @@ static int usb_retake(void)
 	       sizeof(uvc_probe_control_setting));
 
 	DLOG("retaking USB\n");
+	/* Our requests may go out again (the attach that follows arms the
+	 * HID receive). */
+	usb_yielded = 0;
 	ret = usb_takeover();
 	if (ret < 0) {
 		DLOG("retake failed (0x%08X), giving USB back to MTP\n", ret);
+		usb_yielded = 1;
 		usb_restore_mtp();
 	} else {
 		DLOG("retake OK\n");
@@ -1790,7 +2224,7 @@ static int uvc_thread(SceSize args, void *argp)
 	DFLUSH();
 
 #ifdef DEBUG
-	unsigned int dbg_attach_seen = 0, dbg_detach_seen = 0;
+	unsigned int dbg_attach_seen = 0, dbg_detach_seen = 0, dbg_yield_seen = 0;
 	int dbg_stream_seen = 0, dbg_rx_logged = 0, dbg_last_frame_err = 0;
 	unsigned int dbg_rx_err_seen = 0;
 	int dbg_ours_seen = -1, dbg_mtp_seen = -1, dbg_running_seen = -1;
@@ -1843,7 +2277,12 @@ static int uvc_thread(SceSize args, void *argp)
 		if (now - last_hb >= 500000) { /* heartbeat every ~500 ms */
 			last_hb = now;
 #if ENABLE_HEARTBEAT
-			pc_hid_send_input_heartbeat();
+			/* uvc_busy before the check pairs with usb_yield. */
+			uvc_busy = 1;
+			__sync_synchronize();
+			if (!usb_yielded)
+				pc_hid_send_input_heartbeat();
+			uvc_busy = 0;
 #endif
 		}
 
@@ -1988,9 +2427,13 @@ static int uvc_thread(SceSize args, void *argp)
 		if (kill_hold > 0)
 			kill_hold--;
 
-		if (ret == 0 && stream && kill_hold == 0 && !going_down) {
+		uvc_busy = 1;
+		__sync_synchronize();
+		if (ret == 0 && stream && kill_hold == 0 && !going_down &&
+		    !usb_yielded) {
 			BC(bc_uvc_where, 3);
 			int sf = send_frame();
+			uvc_busy = 0;
 			BC(bc_uvc_where, 4);
 #ifdef DEBUG
 			/* Log each new error code once, not every frame. */
@@ -2004,8 +2447,16 @@ static int uvc_thread(SceSize args, void *argp)
 			(void)sf;
 #endif
 		}
+		uvc_busy = 0;
 
 #ifdef DEBUG
+		if (dbg_yield_n != dbg_yield_seen) {
+			dbg_yield_seen = dbg_yield_n;
+			DLOG("yielded USB #%u (StopCurrentInternal), waited %u ms, "
+			     "un-yielded %u\n", dbg_yield_seen, dbg_yield_wait_ms,
+			     dbg_unyield_n);
+			DFLUSH_SAFE();
+		}
 		if (dbg_attach_n != dbg_attach_seen) {
 			dbg_attach_seen = dbg_attach_n;
 			DLOG("attach #%u (usb_version %d)\n",
@@ -2227,7 +2678,12 @@ static int SceUdcd_sub_01E1128C_hook_func(const SceUdcdConfigDescriptor *config_
 			  (config_descriptor, desc_data);
 	}
 
-	if (dst->wTotalLength == config_descriptor->wTotalLength) {
+	/* Only into our own descriptor: this function builds every driver's,
+	 * and VitaShell's storage device (05d3) used to get our video IAD
+	 * too (lsusb -v, 2026-11-25). */
+	if ((config_descriptor == &confdesc_hi ||
+	     config_descriptor == &confdesc_full) &&
+	    dst->wTotalLength == config_descriptor->wTotalLength) {
 		memmove(desc_data + USB_DT_CONFIG_SIZE + sizeof(interface_association_descriptor),
 			desc_data + USB_DT_CONFIG_SIZE,
 			config_descriptor->wTotalLength - USB_DT_CONFIG_SIZE);
@@ -2323,6 +2779,15 @@ int module_start(SceSize argc, const void *args)
 		&SceUdcd_sub_01E1128C_ref, SceUdcd_modinfo.modid, 0,
 		0x01E1128C - 0x01E10000, 1, SceUdcd_sub_01E1128C_hook_func));
 
+	/* VitaShell's USB transfer stops USB through this: step aside first
+	 * (usb_yield). SceUdcdForDriver, ksceUdcdStopCurrentInternal. */
+	udcd_stop_current_hook_uid = DCALL(taiHookFunctionExportForKernel(KERNEL_PID,
+		&udcd_stop_current_ref, "SceUdcd", 0xBC05A8FB, 0x0F3595AE,
+		udcd_stop_current_hook));
+#ifdef USB_PROBE
+	probe_install();
+#endif
+
 	/* Touch hooks are installed lazily once the PC app talks to us,
 	 * and fully removed again when it goes silent (watchdog below). */
 	touch_hooks_install();
@@ -2414,6 +2879,14 @@ int module_stop(SceSize argc, const void *args)
 	if (SceUdcd_sub_01E1128C_hook_uid > 0) {
 		taiHookReleaseForKernel(SceUdcd_sub_01E1128C_hook_uid,
 			SceUdcd_sub_01E1128C_ref);
+	}
+#ifdef USB_PROBE
+	probe_remove();
+#endif
+	if (udcd_stop_current_hook_uid > 0) {
+		taiHookReleaseForKernel(udcd_stop_current_hook_uid,
+			udcd_stop_current_ref);
+		udcd_stop_current_hook_uid = -1;
 	}
 
 	if (touch_peek_hook_uid > 0)

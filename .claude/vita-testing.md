@@ -45,8 +45,8 @@ Copy the `.skprx` to `downloads/`. The user then:
 
 The plugin takes over USB about 40 s after that (`lsusb`: `054c:1337`, video
 on the `/dev/video*` named "PSVita", HID on a `/dev/hidraw*`). With the
-release build, `vitactl.py status` shows the build number (113 as of
-2026-11-26). The test flavour `./build-vita.sh PROBE=1` (build 114) logs every
+release build, `vitactl.py status` shows the build number (115 as of
+2026-11-26). The test flavour `./build-vita.sh PROBE=1` (build 116) logs every
 USB call to `ur0:data/VitaSync_probe.txt` (TODO.md).
 
 Opening VitaShell's USB transfer stops the plugin; the card mounts on the PC
@@ -60,9 +60,9 @@ VitaShell still hung ~30 s after input had been sent into it during a capture;
 PS frees it. After a hang while closing, the Vita hasn't re-read `ux0:`
 (files the PC copied don't show): reboot before writing to `ux0:`.
 
-**After `watch stop`, input is lost** until the next `watch start` or USB
-transfer: the plugin never sees the video stop (TODO.md). Send input before
-stopping the video, or with it running.
+**Input after `watch stop`:** from build 115 it works about 1 s after the
+stop (the plugin notices the PC stopped reading). With older builds it's
+lost until the next `watch start` or USB transfer.
 
 ## Results
 

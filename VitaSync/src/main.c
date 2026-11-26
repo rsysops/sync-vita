@@ -820,6 +820,9 @@ static volatile int going_down;	/* between a "going down" event and a resume */
 static volatile int uvc_frame_waiting;
 /* Set from just before a frame request is queued until it completes. */
 static volatile int uvc_frame_pending;
+/* When that frame was queued (ms since boot, 32 bits so another thread
+ * reads it in one go). See uvc_watchdog_thread. */
+static volatile unsigned int uvc_frame_sent_ms;
 
 /* Cancel the frame request still queued, if any, and let uvc_thread go on
  * if it waits for it. The caller has set stream = 0 (or going_down, or
@@ -969,11 +972,11 @@ static void pc_hid_send_input_heartbeat(void)
 	                         ((exit_phase & 3) << 6));
 	hb[63] =
 #ifdef USB_PROBE
-		114;
+		116;
 #else
-		113;
+		115;
 #endif
-	/* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture, 108 system event probe (test only), 109 = probe + 110's fix (test only), 110 no video frame pending at sleep/reboot, 111 steps aside for VitaShell's USB transfer (StopCurrentInternal hook), frame released at video stop, 112 USB probe (test only), 113 retake 5 s after MTP restarts, 114 = 113 + USB probe (test only) */
+	/* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture, 108 system event probe (test only), 109 = probe + 110's fix (test only), 110 no video frame pending at sleep/reboot, 111 steps aside for VitaShell's USB transfer (StopCurrentInternal hook), frame released at video stop, 112 USB probe (test only), 113 retake 5 s after MTP restarts, 114 = 113 + USB probe (test only), 115 video stop detected (frame unread 1 s), 116 = 115 + USB probe (test only) */
 
 	ep2_try_send(hb);
 	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;
@@ -1095,6 +1098,7 @@ static int uvc_frame_req_submit_phycont(const void *data, unsigned int size)
 		uvc_frame_pending = 0;
 		return 0;
 	}
+	uvc_frame_sent_ms = (unsigned int)(ksceKernelGetSystemTimeWide() / 1000);
 	/* A release while nothing waited leaves the flag set: it must not
 	 * end this frame's wait early. (A poll that clears what it finds;
 	 * it fails harmlessly when the flag isn't set.) */
@@ -1836,7 +1840,7 @@ static volatile unsigned int dbg_yield_n, dbg_yield_wait_ms, dbg_unyield_n;
 
 #ifdef USB_PROBE
 /*
- * USB probe (make PROBE=1, test only, build id 114). Build 111 still left
+ * USB probe (make PROBE=1, test only, build id 116). Build 111 still left
  * VitaShell stuck for ~30 s (PS frees it) when USB transfer opened or
  * closed after input sent into VitaShell during a capture. A first probe
  * with a status thread and a hook on the cable-state check never saw it
@@ -1959,7 +1963,7 @@ static void probe_install(void)
 
 	_Static_assert(sizeof(fns) / sizeof(fns[0]) == PROBE_HOOKS,
 		       "one hook function per probe_hooks entry");
-	n = snprintf(line, sizeof(line), "%8u probe build 114\n",
+	n = snprintf(line, sizeof(line), "%8u probe build 116\n",
 		     (unsigned int)(ksceKernelGetSystemTimeWide() / 1000));
 	probe_write(line, n, 1);
 	for (i = 0; i < PROBE_HOOKS; i++) {
@@ -2052,6 +2056,52 @@ static int udcd_stop_current_hook(int bus)
 	return ret;
 }
 
+/*
+ * Detecting a video stop (build 115).
+ *
+ * The video endpoint is bulk, so the PC's uvcvideo stops a stream with
+ * CLEAR_FEATURE(ENDPOINT_HALT) on EP1, which udcd handles itself and never
+ * passes to uvc_udcd_process_request: uvc_handle_video_abort doesn't run,
+ * stream stays 1, and the last frame stays queued with uvc_thread waiting
+ * on it. Input (pc_control_apply) and the heartbeat run in uvc_thread, so
+ * they stopped too until the next start (TODO.md).
+ *
+ * While the PC streams, uvcvideo keeps reads queued and a frame goes out in
+ * ~25 ms. A frame left unread for UVC_STOP_TIMEOUT_MS means the PC stopped
+ * reading: this thread then does what the abort path would have done. The
+ * cancel comes from this thread, after stream = 0, as in sysevent_handler
+ * and usb_yield (build 103 crashed cancelling in uvc_thread while still
+ * streaming). PC input isn't released: it must keep working.
+ */
+#define UVC_STOP_TIMEOUT_MS	1000
+#define UVC_WATCHDOG_TICK_US	100000
+
+static SceUID uvc_watchdog_id = -1;
+static volatile int uvc_watchdog_run;
+static volatile unsigned int uvc_stop_detected_n;
+
+static int uvc_watchdog_thread(SceSize args, void *argp)
+{
+	(void)args;
+	(void)argp;
+	while (uvc_watchdog_run) {
+		ksceKernelDelayThread(UVC_WATCHDOG_TICK_US);
+		if (!stream || !uvc_frame_pending || usb_yielded || going_down)
+			continue;
+		if ((unsigned int)(ksceKernelGetSystemTimeWide() / 1000) -
+		    uvc_frame_sent_ms < UVC_STOP_TIMEOUT_MS)
+			continue;
+
+		stream = 0;
+		ksceUdcdClearFIFO(&endpoints[1]);
+		uvc_frame_release();
+		uvc_stop_detected_n++;
+		PROBE("video stop detected: frame unread for %u ms",
+		      UVC_STOP_TIMEOUT_MS);
+	}
+	return 0;
+}
+
 /* The debug log is on ur0:, which VitaShell's USB transfer never hands to
  * the PC, so it can be written at any time. */
 #define DFLUSH_SAFE()	DFLUSH()
@@ -2123,6 +2173,7 @@ static int uvc_thread(SceSize args, void *argp)
 
 #ifdef DEBUG
 	unsigned int dbg_attach_seen = 0, dbg_detach_seen = 0, dbg_yield_seen = 0;
+	unsigned int dbg_stop_seen = 0;
 	int dbg_stream_seen = 0, dbg_rx_logged = 0, dbg_last_frame_err = 0;
 	unsigned int dbg_rx_err_seen = 0;
 	int dbg_ours_seen = -1, dbg_mtp_seen = -1, dbg_running_seen = -1;
@@ -2366,6 +2417,12 @@ static int uvc_thread(SceSize args, void *argp)
 		uvc_busy = 0;
 
 #ifdef DEBUG
+		if (uvc_stop_detected_n != dbg_stop_seen) {
+			dbg_stop_seen = uvc_stop_detected_n;
+			DLOG("video stop detected #%u (frame unread for %u ms)\n",
+			     dbg_stop_seen, UVC_STOP_TIMEOUT_MS);
+			DFLUSH_SAFE();
+		}
 		if (dbg_yield_n != dbg_yield_seen) {
 			dbg_yield_seen = dbg_yield_n;
 			DLOG("yielded USB #%u (StopCurrentInternal), waited %u ms, "
@@ -2745,6 +2802,15 @@ int module_start(SceSize argc, const void *args)
 		goto err_unregister;
 	}
 
+	/* Optional: without it, input stops after a video stop, as before
+	 * build 115. */
+	uvc_watchdog_run = 1;
+	uvc_watchdog_id = ksceKernelCreateThread("uvc_watchdog",
+						 uvc_watchdog_thread, 0x40, 0x1000,
+						 0, 0x10000, 0);
+	if (uvc_watchdog_id >= 0)
+		ksceKernelStartThread(uvc_watchdog_id, 0, NULL);
+
 	return SCE_KERNEL_START_SUCCESS;
 
 err_unregister:
@@ -2784,6 +2850,14 @@ int module_stop(SceSize argc, const void *args)
 
 	ksceKernelDeleteEventFlag(uvc_event_flag_id);
 	ksceKernelDeleteThread(uvc_thread_id);
+
+	/* It may release a frame (uvc_frame_req_evflag): stop it first. */
+	if (uvc_watchdog_id >= 0) {
+		uvc_watchdog_run = 0;
+		ksceKernelWaitThreadEnd(uvc_watchdog_id, NULL, NULL);
+		ksceKernelDeleteThread(uvc_watchdog_id);
+		uvc_watchdog_id = -1;
+	}
 
 	uvc_frame_req_fini();
 

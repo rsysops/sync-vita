@@ -39,7 +39,8 @@ the build that hid audio in the frames). Experimental builds 102-104
 - **A 250 ms limit on the frame send's wait, cancelling the request on
   timeout from uvc_thread** (103): worse, a single stop led to a freeze and
   a crash.
-- **uvc_thread stalls after a video stop** (confirmed 2026-11-24 with probe
+- **uvc_thread stalls after a video stop** (fixed in build 115, see below;
+  confirmed 2026-11-24 with probe
   build 108: the heartbeat stops the moment `watch stop` runs and comes
   back only on the next start, a reboot, or an unplug).
   `uvc_frame_req_submit_phycont` waits for its completion with no limit,
@@ -70,15 +71,25 @@ on EP 0x81, not SET_INTERFACE (`uvc_video_stop_streaming`). udcd handles that
 standard request itself and never passes it to `uvc_udcd_process_request`,
 so `uvc_handle_video_abort` doesn't run, `stream` stays 1 and the last frame
 stays queued (probe 112: `stream 1 wait 1 pend 1` tens of seconds after
-`watch stop`). Build 111 added the release (`uvc_frame_release`: cancel EP1,
-set the event flag) to the abort path, which therefore doesn't help here,
-and to the USB transfer yield, which does.
+`watch stop`).
 
-Next: detect the stop another way, then remove the 2 ms wait again. Idea: a
-frame unread for over ~0.5 s means the PC stopped reading; release it from
-another thread than uvc_thread (as `sysevent_handler` and `usb_yield` do;
-103's crash came from cancelling in uvc_thread during streaming). That would
-also bring input back after `watch stop`.
+**Fixed in build 115: the stop is detected, input works after it.** While
+the PC streams, uvcvideo keeps reads queued and a frame goes out in ~25 ms.
+A watchdog thread (`uvc_watchdog_thread`, every 100 ms) treats a frame left
+unread for 1 s (`UVC_STOP_TIMEOUT_MS`) as a stop: `stream = 0`, clear the
+EP1 FIFO, `uvc_frame_release()` (cancel EP1, set the event flag), as the
+abort path would. The cancel comes from that thread after `stream = 0`, as
+in `sysevent_handler` and `usb_yield`; 103's crash came from cancelling in
+uvc_thread while it kept streaming. PC input isn't released. Tested
+2026-11-26: heartbeat and input right after `watch stop` (3 presses moved
+VitaShell's cursor), 10 start/stops at ~47.7 frames/s with the heartbeat
+back after each, 60 s recording with sound on a still screen with no false
+stop (two 50 ms gaps), 480x272 at 60.1 frames/s, SELECT pressed from the PC
+right after a stop (mount 1.04 s), reboot after video.
+
+Next: remove the 2 ms wait after IFTU again (build 102 gave up to 59.8
+frames/s), now that a stop no longer leaves uvc_thread stuck: retest
+several stop/starts in a row first, which is what failed in 102.
 
 ## Video: the Vita won't sleep during a capture
 
@@ -113,8 +124,9 @@ is up.
 
 **Causes and fixes (build 111).**
 
-- **Freeze:** after `watch stop` the last frame stays queued on EP1 with
-  uvc_thread waiting on it (the stop is never seen, see "Video" above), and
+- **Freeze:** after `watch stop` the last frame stayed queued on EP1 with
+  uvc_thread waiting on it (the stop wasn't seen until build 115, see
+  "Video" above), and
   VitaShell's stop hung on it, as reboots did before build 110. The plugin
   now hooks `ksceUdcdStopCurrentInternal` (`SceUdcdForDriver` 0xBC05A8FB, NID
   0x0F3595AE) and steps aside first (`usb_yield`): stops video, sound and

@@ -50,8 +50,9 @@ with sync-vita, then **6** connected again? and **7** bring the results back.
 - **sync-vita:** `$VITACTL --help` lists the commands. The Vita running the
   VitaSync plugin shows as `054c:1337`. Closing VitaShell's USB transfer
   (CIRCLE) gives USB back to the plugin about 5 s later. The plugin can press
-  PS (build 90+). After `$VITACTL watch stop`, input is lost until the next
-  `watch start` or USB transfer: send input before stopping the video.
+  PS (build 90+). After `$VITACTL watch stop`, input works again about 1 s
+  later from plugin build 115; with older builds it's lost until the next
+  `watch start` or USB transfer, so send input before stopping the video.
 - **USB transfer freeze:** with plugin build 110 or older (`$VITACTL status`
   shows the build), opening USB transfer after the video or input was used in
   that boot freezes the Vita until it's forced off (sync-vita's `TODO.md`).

@@ -1,12 +1,12 @@
 TARGET	= VitaSync
-OBJS	= src/main.o src/audio.o src/speaker.o
+OBJS	= src/main.o src/audio.o src/speaker.o src/files.o
 LIBS	= -lSceSysmemForDriver_stub -lSceThreadmgrForDriver_stub \
 	-lSceCpuForDriver_stub -lSceUdcdForDriver_stub \
 	-lSceDisplayForDriver_stub -lSceIftuForDriver_stub \
 	-lSceCtrlForDriver_stub -ltaihenForKernel_stub -lSceTouchForDriver_stub \
 	-lSceAppMgrForDriver_stub -lSceKernelSuspendForDriver_stub \
 	-lSceSysclibForDriver_stub -ltaihenModuleUtils_stub \
-	-lSceDmacmgrForDriver_stub
+	-lSceDmacmgrForDriver_stub -lSceIofilemgrForDriver_stub
 # SceSysclibForDriver must always be linked: it gives memset, memmove and
 # the division helpers from the kernel. Without it they come from vitasdk's
 # libc, which imports them from the user-mode SceLibKernel, and a kernel
@@ -14,14 +14,12 @@ LIBS	= -lSceSysmemForDriver_stub -lSceThreadmgrForDriver_stub \
 ifeq ($(DEBUG), 1)
 	OBJS	+= debug/log.o
 	CFLAGS	+= -DDEBUG -Idebug
-	LIBS	+= -lSceIofilemgrForDriver_stub
 endif
 
 # Test only: logs every USB start/stop/activate/deactivate call, with how
 # long it took, to ur0:data/VitaSync_probe.txt (see USB_PROBE in main.c).
 ifeq ($(PROBE), 1)
 	CFLAGS	+= -DUSB_PROBE
-	LIBS	+= -lSceIofilemgrForDriver_stub
 endif
 
 ifeq ($(DISPLAY_OFF_OLED), 1)

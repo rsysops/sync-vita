@@ -15,6 +15,7 @@
 #include "usb_descriptors.h"
 #include "uvc.h"
 #include "audio.h"
+#include "files.h"
 #include "speaker.h"
 
 /* Debug log (make DEBUG=1): lines are buffered and written to
@@ -860,6 +861,8 @@ static int sysevent_handler(int resume, int eventid, void *args, void *opt)
 		going_down = 0;
 	} else {
 		going_down = 1;		/* uvc_thread sends no more frames */
+		/* No file transfer either: file IO blocks a shutdown. */
+		files_set_online(0);
 		stream = 0;
 		/* Each repeated event cancels again while the frame hasn't
 		 * completed. */
@@ -980,11 +983,11 @@ static void pc_hid_send_input_heartbeat(void)
 	                         ((exit_phase & 3) << 6));
 	hb[63] =
 #ifdef USB_PROBE
-		118;
+		122;
 #else
-		117;
+		121;
 #endif
-	/* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture, 108 system event probe (test only), 109 = probe + 110's fix (test only), 110 no video frame pending at sleep/reboot, 111 steps aside for VitaShell's USB transfer (StopCurrentInternal hook), frame released at video stop, 112 USB probe (test only), 113 retake 5 s after MTP restarts, 114 = 113 + USB probe (test only), 115 video stop detected (frame unread 1 s), 116 = 115 + USB probe (test only), 117 no 2 ms wait after IFTU, 118 = 117 + USB probe (test only) */
+	/* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture, 108 system event probe (test only), 109 = probe + 110's fix (test only), 110 no video frame pending at sleep/reboot, 111 steps aside for VitaShell's USB transfer (StopCurrentInternal hook), frame released at video stop, 112 USB probe (test only), 113 retake 5 s after MTP restarts, 114 = 113 + USB probe (test only), 115 video stop detected (frame unread 1 s), 116 = 115 + USB probe (test only), 117 no 2 ms wait after IFTU, 118 = 117 + USB probe (test only), 119 file transfer over USB (interface 5), 120 = 119 + USB probe (test only), 121 = 119 with 5 s file timeouts, 122 = 121 + USB probe (test only) */
 
 	ep2_try_send(hb);
 	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;
@@ -1456,6 +1459,7 @@ static int uvc_udcd_attach(int usb_version, void *user_data)
 	BC(bc_attach_step, 4);
 	pc_hid_start_receive();
 	BC(bc_attach_step, 9);
+	files_set_online(1);
 
 #if defined(DISPLAY_OFF_OLED)
 	prev_brightness = ksceOledGetBrightness();
@@ -1478,6 +1482,7 @@ static void uvc_udcd_detach(void *user_data)
 #endif
 	BC(bc_detach_step, 1);
 	audio_set_streaming(0);
+	files_set_online(0);
 	uvc_handle_video_abort();
 	BC(bc_detach_step, 2);
 	ksceUdcdReqCancelAll(&endpoints[3]);
@@ -1534,7 +1539,7 @@ static int uvc_driver_stop(int size, void *p, void *user_data)
 
 static SceUdcdDriver uvc_udcd_driver = {
 	.driverName			= UVC_DRIVER_NAME,
-	.numEndpoints			= 5,
+	.numEndpoints			= 7,
 	.endpoints			= endpoints,
 	.interface			= &interface,
 	.descriptor_hi			= &devdesc_hi,
@@ -1847,7 +1852,7 @@ static volatile unsigned int dbg_yield_n, dbg_yield_wait_ms, dbg_unyield_n;
 
 #ifdef USB_PROBE
 /*
- * USB probe (make PROBE=1, test only, build id 118). Build 111 still left
+ * USB probe (make PROBE=1, test only, build id 122). Build 111 still left
  * VitaShell stuck for ~30 s (PS frees it) when USB transfer opened or
  * closed after input sent into VitaShell during a capture. A first probe
  * with a status thread and a hook on the cable-state check never saw it
@@ -1970,7 +1975,7 @@ static void probe_install(void)
 
 	_Static_assert(sizeof(fns) / sizeof(fns[0]) == PROBE_HOOKS,
 		       "one hook function per probe_hooks entry");
-	n = snprintf(line, sizeof(line), "%8u probe build 118\n",
+	n = snprintf(line, sizeof(line), "%8u probe build 122\n",
 		     (unsigned int)(ksceKernelGetSystemTimeWide() / 1000));
 	probe_write(line, n, 1);
 	for (i = 0; i < PROBE_HOOKS; i++) {
@@ -2026,6 +2031,9 @@ static void usb_yield(void)
 	ep2_busy = 0;
 	ksceUdcdReqCancelAll(&endpoints[3]);
 	ksceUdcdReqCancelAll(&endpoints[4]);
+	files_set_online(0);
+	ksceUdcdReqCancelAll(&endpoints[5]);
+	ksceUdcdReqCancelAll(&endpoints[6]);
 	PROBE("  yield: all requests cancelled");
 }
 
@@ -2799,6 +2807,9 @@ int module_start(SceSize argc, const void *args)
 	/* USB audio (Vita sound to the PC): optional, the rest works without. */
 	ret = DCALL(audio_init(&endpoints[4]));
 
+	/* File transfer (vitactl.py ls/push/pull): optional too. */
+	ret = DCALL(files_init(&endpoints[5], &endpoints[6]));
+
 	/* Last line before uvc_thread runs: from here on only that thread
 	 * writes to the log buffer. */
 	DLOG("module_start: starting uvc_thread\n");
@@ -2854,6 +2865,7 @@ int module_stop(SceSize argc, const void *args)
 	ksceKernelWaitThreadEnd(uvc_thread_id, NULL, NULL);
 
 	audio_fini();
+	files_fini();
 
 	ksceKernelDeleteEventFlag(uvc_event_flag_id);
 	ksceKernelDeleteThread(uvc_thread_id);

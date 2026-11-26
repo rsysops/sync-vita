@@ -10,9 +10,10 @@ hardware values found by **vitastream** (`devnoname120/vitastream`, GPL-3.0).
 ## What's in it
 
 - `VitaSync/` — Vita kernel plugin (`VitaSync.skprx`): UVC video, USB audio
-  (the Vita's sound) and vendor HID. Device name `PSVita`, USB ID `054c:1337`.
-- `linux/` — `vitactl.py`, the command-line tool (screen, recordings, input),
-  and the udev rule it needs.
+  (the Vita's sound), vendor HID (input) and file transfer. Device name
+  `PSVita`, USB ID `054c:1337`.
+- `linux/` — `vitactl.py`, the command-line tool (screen, recordings, input,
+  files), and the udev rule it needs.
 - `TESTING.md` — an end-to-end test scenario; `TODO.md` — known problems and
   next steps.
 - `.claude/skills/vita-testing/` — a Claude Code skill to test homebrew on the
@@ -48,7 +49,8 @@ On Linux, build the plugin with `./build-vita.sh` (Docker, `vitasdk/vitasdk:2026
 `linux/vitactl.py` (Python 3, standard library and `ffmpeg`) saves the Vita's
 screen, records it, and sends input.
 
-1. Once, let your user send input and keep the Vita's USB awake:
+1. Once, let your user send input and copy files, and keep the Vita's USB
+   awake (reinstall it if you installed it before build 119):
 
    ```bash
    sudo cp linux/70-vitasync.rules /etc/udev/rules.d/
@@ -111,6 +113,27 @@ plain WAV:
 ```bash
 arecord -D hw:CARD=PSVita,DEV=0 -f S16_LE -r 48000 -c 2 -d 10 sound.wav
 ```
+
+**Files** (plugin build 119+). Files go to and from the Vita over the same
+cable, without VitaShell, even while a game runs:
+
+```bash
+./linux/vitactl.py ls ux0:data
+./linux/vitactl.py push myfile.txt ux0:data/          # into a folder
+./linux/vitactl.py pull ur0:data/VitaSync_log.txt .
+./linux/vitactl.py push -r myfolder ux0:data/         # a whole folder
+./linux/vitactl.py mkdir|rm|rmdir|mv|stat ...
+```
+
+The Vita's own filesystem does every read and write (the card is never
+shared with the PC as a disk). Only `ux0:`, `ur0:`, `uma0:`, `imc0:`, `xmc0:`
+and `grw0:` are served; the plugin refuses the system partitions. Deleting or
+replacing a file asks first (`[y/N]`; in scripts, `--yes`), `rmdir` only
+deletes empty folders, and `-r` never replaces anything. A pushed file is
+written under a temporary name and renamed at the end, so an interrupted push
+never leaves a half file in its place. Measured on 2026-11-26: push 10.5 MB/s,
+pull 15 MB/s, and the video keeps running (about 47 frames/s at 960x544 during a
+push). Dates are shown as the Vita reports them, in UTC.
 
 Opening VitaShell's USB transfer takes USB away from the plugin; it takes USB
 back by itself about 5 s after the transfer is closed.

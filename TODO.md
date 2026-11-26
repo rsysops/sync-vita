@@ -186,14 +186,31 @@ called, hook the public ones.
 PC connects (logger thread blocked? `log_buf` full?), so it can't catch a
 hang; the probe writes its lines directly instead.
 
-## Next: VitaSync's own file transfer over USB
+## Done in build 119-121: VitaSync's own file transfer over USB
 
-File-level, not mass storage (the PC and the Vita would both write the same
-exFAT): a vendor bulk interface next to video, HID and sound, a plugin
-thread doing `ksceIoOpen/Read/Write`, and `vitactl.py ls/push/pull/rm` over
-usbdevfs (standard library only). It would work while a game runs, without
-VitaShell, and the vita-testing skill could deploy builds and fetch logs
-with no steps from the user. Needs its own plan.
+File-level, not mass storage: vendor interface 5 with two bulk endpoints,
+one kernel thread doing all the IO (`src/files.c`, protocol in
+`include/files.h`), and `vitactl.py ls/stat/pull/push/mkdir/rm/rmdir/mv`
+over usbdevfs. Allowed devices only (`ux0:` `ur0:` `uma0:` `imc0:` `xmc0:`
+`grw0:`); PUT and RENAME refuse an existing target unless the request says
+overwrite, and vitactl.py asks before any deletion or overwrite (`--yes`
+without a terminal); nothing recursive deletes or overwrites. Notes:
+
+- udcd numbers the endpoints itself (the descriptor's 0x85/0x06 came out as
+  0x87 IN, 0x04 OUT; HID is 0x83/0x02, sound 0x85): vitactl.py reads them
+  from `/sys/bus/usb/devices/*/*:1.5/ep_*`.
+- Tested 2026-11-26: round trips at 0 B to 200 MiB including 511/512/513 and
+  256 KiB +/-1 (sha256 identical), push 10.5 MB/s, pull 15 MB/s, 50 MiB push
+  during video+sound (video 47 frames/s, no gap over 34 ms), refusals (system
+  partitions, overwrite without the bit, non-empty rmdir), VitaShell's USB
+  transfer opened mid-pull (no freeze, retake, next command fine), a push
+  interrupted with Ctrl-C (no leftover; the next command waits ~6 s while the
+  plugin drops the push: 5 s without data, build 121), and build 121 itself
+  installed into `ur0:tai/` with `push --yes` then booted.
+- Dates are the Vita's, in UTC.
+
+Ideas: show the PC's local time; `push`/`pull` resuming at an offset (GET
+already takes one).
 
 ## Small things
 

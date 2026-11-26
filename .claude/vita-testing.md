@@ -11,11 +11,16 @@ FTP_PORT=1337
 VITACTL=/home/ryan/Documents/Loisirs/Jeux/PSVita/Dev/sync-vita/linux/vitactl.py
 ```
 
+From plugin build 119 the plugin itself is the first link: `$VITACTL ls ux0:`
+(the udev rule in `linux/70-vitasync.rules` is installed, with its line for
+`/dev/bus/usb`). Measured: push 10.5 MB/s, pull 15 MB/s.
+
 ## Folder on ux0:
 
-`downloads/` (`ux0:downloads/`). Debug builds write their log to
-`ur0:data/VitaSync_log.txt`, which USB transfer doesn't expose: the user
-copies it to `ux0:downloads/` in VitaShell before opening USB transfer.
+`downloads/` (`ux0:downloads/`), only when the plugin link isn't available.
+Debug builds write their log to `ur0:data/VitaSync_log.txt`: the plugin link
+reads it there; USB transfer doesn't expose `ur0:` (then the user copies it
+to `ux0:downloads/` in VitaShell first).
 
 ## Flavours
 
@@ -36,17 +41,31 @@ if the plugin imports the user-mode `SceLibKernel`.
 
 ## Destination
 
-Copy the `.skprx` to `downloads/`. The user then:
+`ur0:tai/VitaSync.skprx` (`config.txt` already loads it in `*KERNEL`).
 
-1. moves it over `ur0:tai/VitaSync.skprx` in VitaShell
-   (`config.txt` already loads it in `*KERNEL`);
-2. powers the Vita off, powers it on, and runs henlo with "Mount sd2vita and
-   exit".
+**With the plugin link (build 119+ running):**
+
+1. `$VITACTL pull ur0:tai/VitaSync.skprx "$DEST/VitaSync-previous.skprx"`:
+   the rollback copy stays on the PC (never on the Vita);
+2. ask the user, then
+   `$VITACTL push --yes VitaSync/VitaSync.skprx ur0:tai/VitaSync.skprx`
+   (it replaces the file the running plugin was loaded from: fine, the
+   plugin runs from memory);
+3. the user powers the Vita off, powers it on, and runs henlo with "Mount
+   sd2vita and exit".
+
+If the new build doesn't come back (no `054c:1337`), the plugin link is
+gone with it: the user puts the rollback copy back through USB transfer or
+FTP, below.
+
+**Otherwise:** copy the `.skprx` to `downloads/`. The user moves it over
+`ur0:tai/VitaSync.skprx` in VitaShell, then powers off and on and runs
+henlo.
 
 The plugin takes over USB about 40 s after that (`lsusb`: `054c:1337`, video
 on the `/dev/video*` named "PSVita", HID on a `/dev/hidraw*`). With the
-release build, `vitactl.py status` shows the build number (117 as of
-2026-11-26). The test flavour `./build-vita.sh PROBE=1` (build 118) logs every
+release build, `vitactl.py status` shows the build number (121 as of
+2026-11-26). The test flavour `./build-vita.sh PROBE=1` (build 122) logs every
 USB call to `ur0:data/VitaSync_probe.txt` (TODO.md).
 
 Opening VitaShell's USB transfer stops the plugin; the card mounts on the PC
@@ -68,10 +87,12 @@ lost until the next `watch start` or USB transfer.
 
 `RESULTS="VitaSync_log.txt"`, `DEST=/tmp/sync-vita-...`
 
-- `VitaSync_log.txt` (debug flavour only), copied by the user from
-  `ur0:data/` to `ux0:downloads/`: the plugin's startup and USB events. Each
-  plugin load starts it afresh, so after a freeze the user boots with **L**
-  held when leaving henlo's menu (no plugins), then copies it.
+- `VitaSync_log.txt` (debug flavour only), in `ur0:data/`: the plugin's
+  startup and USB events. With the plugin link: `$VITACTL pull
+  ur0:data/VitaSync_log.txt "$DEST/"`. Otherwise the user copies it to
+  `ux0:downloads/` first. Each plugin load starts it afresh, so after a
+  freeze the user boots with **L** held when leaving henlo's menu (no
+  plugins, so no plugin link either), then copies it.
 
 ## Never touched
 

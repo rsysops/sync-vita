@@ -330,14 +330,26 @@ _Static_assert(sizeof(audio_ep_extra) == 9, "audio endpoint extra size");
 				 sizeof(audio_iad) + sizeof(audio_control_cs) + \
 				 sizeof(audio_stream_cs) + sizeof(audio_ep_extra))
 
+/*
+ * File transfer (build 119): a vendor-specific interface with one bulk IN
+ * and one bulk OUT endpoint. No driver on the PC binds to it; vitactl.py
+ * claims it through usbdevfs (src/files.c has the protocol).
+ */
+#define FILES_INTERFACE		5
+#define FILES_EP_IN		5
+#define FILES_EP_OUT		6
+#define FILES_DESC_BYTES	(USB_DT_INTERFACE_SIZE + 2 * USB_DT_ENDPOINT_SIZE)
+
 /* Endpoint blocks */
 static
-struct SceUdcdEndpoint endpoints[5] = {
+struct SceUdcdEndpoint endpoints[7] = {
 	{USB_ENDPOINT_OUT, 0, 0, 0},
 	{USB_ENDPOINT_IN, 1, 0, 0},
 	{USB_ENDPOINT_IN, 2, 0, 0},
 	{USB_ENDPOINT_OUT, 3, 0, 0},
 	{USB_ENDPOINT_IN, AUDIO_EP_IN, 0, 0},
+	{USB_ENDPOINT_IN, FILES_EP_IN, 0, 0},
+	{USB_ENDPOINT_OUT, FILES_EP_OUT, 0, 0},
 };
 
 /* Interface */
@@ -345,7 +357,7 @@ static
 struct SceUdcdInterface interface = {
 	.expectNumber		= -1,
 	.interfaceNumber	= 0,
-	.numInterfaces		= 5
+	.numInterfaces		= 6
 };
 
 /* String descriptors */
@@ -384,7 +396,7 @@ struct SceUdcdDeviceDescriptor devdesc_hi = {
 
 /* Hi-Speed endpoint descriptors */
 static
-struct SceUdcdEndpointDescriptor endpdesc_hi[5] = {
+struct SceUdcdEndpointDescriptor endpdesc_hi[7] = {
 	/* Video Streaming endpoint */
 	{
 		USB_DT_ENDPOINT_SIZE, USB_DT_ENDPOINT,
@@ -407,12 +419,21 @@ struct SceUdcdEndpointDescriptor endpdesc_hi[5] = {
 		USB_ENDPOINT_IN | AUDIO_EP_IN, UAC_EP_ISO_ASYNC, UAC_PACKET_BYTES, 0x04,
 		audio_ep_extra, sizeof(audio_ep_extra)
 	},
+	/* File transfer: bulk IN, then bulk OUT */
+	{
+		USB_DT_ENDPOINT_SIZE, USB_DT_ENDPOINT,
+		USB_ENDPOINT_IN | FILES_EP_IN, USB_ENDPOINT_TYPE_BULK, 0x200, 0x00
+	},
+	{
+		USB_DT_ENDPOINT_SIZE, USB_DT_ENDPOINT,
+		USB_ENDPOINT_OUT | FILES_EP_OUT, USB_ENDPOINT_TYPE_BULK, 0x200, 0x00
+	},
 	{0}
 };
 
 /* Hi-Speed interface descriptor */
 static
-struct SceUdcdInterfaceDescriptor interdesc_hi[7] = {
+struct SceUdcdInterfaceDescriptor interdesc_hi[8] = {
 	{	/* Standard Video Control Interface Descriptor */
 		USB_DT_INTERFACE_SIZE,
 		USB_DT_INTERFACE,
@@ -466,17 +487,24 @@ struct SceUdcdInterfaceDescriptor interdesc_hi[7] = {
 		USB_CLASS_AUDIO, UAC_SUBCLASS_AUDIOSTREAMING, 0x00, 0,
 		&endpdesc_hi[3], audio_stream_cs, sizeof(audio_stream_cs)
 	},
+	{	/* File transfer: vendor-specific, bulk IN + OUT */
+		USB_DT_INTERFACE_SIZE, USB_DT_INTERFACE,
+		FILES_INTERFACE, 0, 2,
+		0xFF, 0x00, 0x00, 0,
+		&endpdesc_hi[4], NULL, 0
+	},
 	{0}
 };
 
 /* Hi-Speed settings */
 static
-struct SceUdcdInterfaceSettings settings_hi[5] = {
+struct SceUdcdInterfaceSettings settings_hi[6] = {
 	{&interdesc_hi[0], 0, 1},
 	{&interdesc_hi[1], 0, 1},
 	{&interdesc_hi[2], 0, 1},
 	{&interdesc_hi[3], 0, 1},
 	{&interdesc_hi[4], 0, 2},	/* audio streaming: alternates 0 and 1 */
+	{&interdesc_hi[6], 0, 1},	/* file transfer */
 };
 
 /* Hi-Speed configuration descriptor */
@@ -487,8 +515,8 @@ struct SceUdcdConfigDescriptor confdesc_hi = {
 	    (USB_DT_CONFIG_SIZE + 3 * USB_DT_INTERFACE_SIZE + 3 * USB_DT_ENDPOINT_SIZE +
 		sizeof(video_control_descriptors) +
 		sizeof(video_streaming_descriptors) + sizeof(hiddesc) +
-		AUDIO_DESC_BYTES),	/* wTotalLength */
-	5,			/* bNumInterfaces */
+		AUDIO_DESC_BYTES + FILES_DESC_BYTES),	/* wTotalLength */
+	6,			/* bNumInterfaces */
 	1,			/* bConfigurationValue */
 	0,			/* iConfiguration */
 	0x80,			/* bmAttributes */
@@ -528,7 +556,7 @@ struct SceUdcdDeviceDescriptor devdesc_full = {
 
 /* Full-Speed endpoint descriptors */
 static
-struct SceUdcdEndpointDescriptor endpdesc_full[5] = {
+struct SceUdcdEndpointDescriptor endpdesc_full[7] = {
 	{
 		USB_DT_ENDPOINT_SIZE, USB_DT_ENDPOINT,
 		USB_ENDPOINT_IN | 0x01, USB_ENDPOINT_TYPE_BULK, 0x40, 0x00
@@ -548,12 +576,21 @@ struct SceUdcdEndpointDescriptor endpdesc_full[5] = {
 		USB_ENDPOINT_IN | AUDIO_EP_IN, UAC_EP_ISO_ASYNC, UAC_PACKET_BYTES, 0x01,
 		audio_ep_extra, sizeof(audio_ep_extra)
 	},
+	/* File transfer: bulk IN, then bulk OUT */
+	{
+		USB_DT_ENDPOINT_SIZE, USB_DT_ENDPOINT,
+		USB_ENDPOINT_IN | FILES_EP_IN, USB_ENDPOINT_TYPE_BULK, 0x40, 0x00
+	},
+	{
+		USB_DT_ENDPOINT_SIZE, USB_DT_ENDPOINT,
+		USB_ENDPOINT_OUT | FILES_EP_OUT, USB_ENDPOINT_TYPE_BULK, 0x40, 0x00
+	},
 	{0}
 };
 
 /* Full-Speed interface descriptor */
 static
-struct SceUdcdInterfaceDescriptor interdesc_full[7] = {
+struct SceUdcdInterfaceDescriptor interdesc_full[8] = {
 	{	/* Standard Video Control Interface Descriptor */
 		USB_DT_INTERFACE_SIZE,
 		USB_DT_INTERFACE,
@@ -607,17 +644,24 @@ struct SceUdcdInterfaceDescriptor interdesc_full[7] = {
 		USB_CLASS_AUDIO, UAC_SUBCLASS_AUDIOSTREAMING, 0x00, 0,
 		&endpdesc_full[3], audio_stream_cs, sizeof(audio_stream_cs)
 	},
+	{	/* File transfer: vendor-specific, bulk IN + OUT */
+		USB_DT_INTERFACE_SIZE, USB_DT_INTERFACE,
+		FILES_INTERFACE, 0, 2,
+		0xFF, 0x00, 0x00, 0,
+		&endpdesc_full[4], NULL, 0
+	},
 	{0}
 };
 
 /* Full-Speed settings */
 static
-struct SceUdcdInterfaceSettings settings_full[5] = {
+struct SceUdcdInterfaceSettings settings_full[6] = {
 	{&interdesc_full[0], 0, 1},
 	{&interdesc_full[1], 0, 1},
 	{&interdesc_full[2], 0, 1},
 	{&interdesc_full[3], 0, 1},
-	{&interdesc_full[4], 0, 2}	/* audio streaming: alternates 0 and 1 */
+	{&interdesc_full[4], 0, 2},	/* audio streaming: alternates 0 and 1 */
+	{&interdesc_full[6], 0, 1},	/* file transfer */
 };
 
 /* Full-Speed configuration descriptor */
@@ -628,8 +672,8 @@ struct SceUdcdConfigDescriptor confdesc_full = {
 	    (USB_DT_CONFIG_SIZE + 3 * USB_DT_INTERFACE_SIZE + 3 * USB_DT_ENDPOINT_SIZE +
 		sizeof(video_control_descriptors) +
 		sizeof(video_streaming_descriptors) + sizeof(hiddesc) +
-		AUDIO_DESC_BYTES),	/* wTotalLength */
-	5,			/* bNumInterfaces */
+		AUDIO_DESC_BYTES + FILES_DESC_BYTES),	/* wTotalLength */
+	6,			/* bNumInterfaces */
 	1,			/* bConfigurationValue */
 	0,			/* iConfiguration */
 	0x80,			/* bmAttributes */

@@ -1,6 +1,6 @@
 ---
 name: vita-testing
-description: Test a build of the current project on the PS Vita. Reads the project's .claude/vita-testing.md, checks the Vita is reachable over USB or FTP, builds and copies the build, then offers to run the test with sync-vita (Claude sees the screen and sends input) or tells the user what to try, and finally moves the results off the Vita (USB or FTP) to a folder in /tmp and reads them. Use when the user asks to test on the Vita, to copy or send a build to the Vita, or to fetch, move or read results from it.
+description: Test a build of the current project on the PS Vita. Reads the project's .claude/vita-testing.md, checks the Vita is reachable (VitaSync plugin's file transfer, USB or FTP), builds and copies the build, then offers to run the test with sync-vita (Claude sees the screen and sends input) or tells the user what to try, and finally moves the results off the Vita to a folder in /tmp and reads them. Use when the user asks to test on the Vita, to copy or send a build to the Vita, or to fetch, move or read results from it.
 argument-hint: "[flavour]"
 ---
 
@@ -16,7 +16,14 @@ with sync-vita, then **6** connected again? and **7** bring the results back.
   file's **Connection** section (step 0). Below, `FTP="ftp://$VITA_IP:$FTP_PORT"`.
 - **VitaShell** is opened from LiveArea through the **VitaDeploy** app:
   VitaDeploy > **File Manager**. "VitaShell" below means that.
-- The Vita is reached one of two ways, called `$LINK` below:
+- The Vita is reached one of three ways, called `$LINK` below:
+  - **Plugin:** the VitaSync plugin's own file transfer, over the cable it
+    already uses (plugin build 119+; `054c:1337`). No VitaShell, PS stays
+    free, and it works while an app runs. `$VITACTL ls|stat|pull [-r]|push
+    [-r]|mkdir|rm|rmdir|mv`, paths like `ux0:data/file` (only `ux0:`
+    `ur0:` `uma0:` `imc0:` `xmc0:` `grw0:`). `push` checks the size on the
+    Vita after copying. Deleting or replacing anything needs `--yes`
+    (see the rule below); `-r` never replaces a file.
   - **USB:** VitaShell's USB mode (SELECT in its File Manager; `lsusb`:
     `054c:05d3`) mounts the memory card, `ux0:`, at `$MOUNT`.
   - **FTP:** VitaShell's FTP server. Paths look like `$FTP/ux0:/data/...`.
@@ -53,6 +60,11 @@ with sync-vita, then **6** connected again? and **7** bring the results back.
   PS (build 90+). After `$VITACTL watch stop`, input works again about 1 s
   later from plugin build 115; with older builds it's lost until the next
   `watch start` or USB transfer, so send input before stopping the video.
+- **Deleting or overwriting anything on the Vita** (any link: `rm`,
+  `rmdir`, a `push`/`mv`/copy onto an existing file, an `eboot.bin`
+  replaced, results deleted after copying): ask the user first, every
+  time, naming the command and the target. Their OK covers that one
+  command, not the next. With the plugin link, `--yes` is added only then.
 - **USB transfer freeze:** with plugin build 110 or older (`$VITACTL status`
   shows the build), opening USB transfer after the video or input was used in
   that boot freezes the Vita until it's forced off (sync-vita's `TODO.md`).
@@ -88,12 +100,18 @@ headings, then go on.
 
 ## 1. Connected?
 
-Try USB, then FTP. The first that answers is `$LINK` for this run:
+Try the plugin, then USB, then FTP. The first that answers is `$LINK` for
+this run:
 
 ```bash
+$VITACTL ls ux0:                            # plugin (build 119+): the card's folders
 ls "$MOUNT/"                                # USB: expect app/ data/ VitaShell/ among others
 curl -sS --connect-timeout 5 "$FTP/ux0:/"   # FTP: lists the card's folders
 ```
+
+`$VITACTL ls` saying the plugin has no file transfer (older than 119), or
+no permission (udev rule missing: its message says how to install it),
+means: use USB or FTP.
 
 - With plugin build 110 or older, if `$VITACTL` has sent input or run
   `status` in this boot, only FTP counts (freeze).
@@ -119,7 +137,18 @@ curl -sS --connect-timeout 5 "$FTP/ux0:/"   # FTP: lists the card's folders
      its `eboot.bin`;
    - an app that isn't: the `.vpk` to `downloads/`;
    - anything else: to the project's **Destination**.
+
+   Replacing an existing file (`eboot.bin`, a plugin...) is an overwrite:
+   ask the user first (see the rule above).
 3. Check the copy:
+
+   **Plugin:** `push` copies to `<path>.vstmp` and renames it at the end,
+   then checks the size on the Vita:
+
+   ```bash
+   $VITACTL push <source> <path on the Vita>          # a new file
+   $VITACTL push --yes <source> <path on the Vita>    # replacing one, after the user's OK
+   ```
 
    **USB:** compare, and flush it to the card:
 
@@ -207,8 +236,9 @@ Tell the user, in a few numbered lines:
    `$VITACTL record SECONDS "$DEST/<what>.mkv" [--before S]` (in the
    background, `&`, while `run` plays the inputs), then `$VITACTL analyze`
    on it, and look at the pictures it flags rather than at every frame.
-5. **When done:** quit the app (`press PS`, then close it if needed). With
-   plugin build 110 or older, this boot is now **FTP only** (freeze). Open VitaDeploy from LiveArea
+5. **When done:** quit the app (`press PS`, then close it if needed). If
+   `$VITACTL ls ux0:` answers (plugin link), go to step 6: no FTP needed.
+   With plugin build 110 or older, this boot is now **FTP only** (freeze). Otherwise open VitaDeploy from LiveArea
    (find its bubble in a shot, `touch` it, start it), choose **File
    Manager**, then start its FTP server ("Setting SELECT to FTP", then SELECT). Check in
    a shot that its dialog shows `$VITA_IP` (say so if it doesn't), then
@@ -233,6 +263,22 @@ passes.
    **USB:** `mv` across drives copies first and deletes each original only
    after its copy succeeded, which leaves the Vita's folder clean for the
    next run:
+
+   **Plugin:** pull each result, check it arrived, then (after asking the
+   user, naming the files) delete it on the Vita:
+
+   ```bash
+   SRC="ux0:<folder on ux0:>"
+   DEST=/tmp/<project>-$(date +%Y%m%d-%H%M)   # or the one from step 5
+   RESULTS="<result files and folders, space-separated>"
+   mkdir -p "$DEST"
+   for f in $RESULTS; do $VITACTL stat "$SRC/$f" >/dev/null 2>&1 && $VITACTL pull -r "$SRC/$f" "$DEST/"; done
+   ls -laR "$DEST"
+   # after the user's OK, for each pulled file: $VITACTL rm --yes "$SRC/<file>"
+   ```
+
+   Logs on `ur0:` (which USB transfer doesn't expose) come back the same
+   way.
 
    ```bash
    SRC="$MOUNT/<folder on ux0:>"
@@ -296,6 +342,8 @@ passes.
 - Delete nothing on the Vita but the results moved in step 7, and only
   once each one has been copied. Never touch what the project file lists
   under **Never touched**.
+- Never delete or overwrite anything on the Vita, and never pass `--yes`
+  to `$VITACTL`, without asking the user first for that very command.
 - With plugin build 110 or older, never ask for USB transfer in a boot where
   `$VITACTL` has sent input or run `status`; use FTP or have the Vita
   rebooted first.

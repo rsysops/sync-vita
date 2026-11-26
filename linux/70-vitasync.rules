@@ -5,6 +5,10 @@
 # Let the logged-in user send input through the HID interface.
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="1337", MODE="0660", TAG+="uaccess"
 
+# Let the logged-in user use the file transfer (plugin build 119+): vitactl.py
+# talks to the plugin's vendor interface through /dev/bus/usb.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="054c", ATTR{idProduct}=="1337", MODE="0660", TAG+="uaccess"
+
 # Keep the Vita's USB awake: when Linux suspends the idle device, the plugin
 # sees a detach and releases all input.
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="054c", ATTR{idProduct}=="1337", TEST=="power/control", ATTR{power/control}="on"

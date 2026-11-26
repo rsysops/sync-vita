@@ -30,6 +30,20 @@ send it buttons, sticks and touches over USB.
   vitactl.py kill                      quit the game (only games that read touch)
   vitactl.py status                    devices, watch, and what the Vita reports
 
+Files on the Vita, over the same USB cable (plugin build 119+, no VitaShell):
+  vitactl.py ls [PATH]                 list a folder (default ux0:)
+  vitactl.py stat PATH                 size and date
+  vitactl.py pull [-r] REMOTE [LOCAL]  copy to the PC (-r: a folder)
+  vitactl.py push [-r] LOCAL REMOTE    copy to the Vita (REMOTE ending in / or
+                                       an existing folder: into it)
+  vitactl.py mkdir PATH                create a folder
+  vitactl.py rm PATH                   delete one file
+  vitactl.py rmdir PATH                delete an empty folder
+  vitactl.py mv OLD NEW                rename or move
+  Paths look like ux0:data/file. Only ux0: ur0: uma0: imc0: xmc0: grw0: are
+  served. Deleting or replacing anything asks first ([y/N]); without a
+  terminal it's refused unless --yes is given. -r never replaces a file.
+
 Buttons: SELECT START UP RIGHT DOWN LEFT L R TRIANGLE CIRCLE CROSS SQUARE,
 PS VOLUP VOLDOWN (plugin build 90+/91+), L3 R3 (PS TV and controllers only).
 
@@ -46,6 +60,8 @@ of an input command. Standard library only.
 """
 
 import array
+import errno
+import fcntl
 import glob
 import json
 import math
@@ -54,6 +70,7 @@ import select
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -1072,6 +1089,510 @@ def cmd_status():
             print(f"Vita speaker: {speaker}")
 
 
+# ---- files over USB (plugin build 119+) ----
+#
+# The plugin's vendor interface 5 (one bulk IN, one bulk OUT endpoint; the
+# Vita numbers them itself, so they're read from sysfs), claimed through
+# usbdevfs. Protocol: VitaSync/include/files.h (keep both in step).
+# Deleting or overwriting anything asks first; without a terminal it needs
+# --yes. Nothing recursive deletes or overwrites.
+
+FILES_IF = 5
+FILES_REQ_MAGIC, FILES_RESP_MAGIC = 0x31465356, 0x31525356   # "VSF1", "VSR1"
+FILES_REQ_SIZE, FILES_RESP_SIZE = 1024, 64
+FILES_CHUNK = 256 * 1024
+FILES_PATH_MAX = FILES_REQ_SIZE - 32 - 8
+FILES_OVERWRITE = 1
+OP_PING, OP_STAT, OP_LIST, OP_GET, OP_PUT, OP_MKDIR, OP_REMOVE, OP_RMDIR, OP_RENAME = range(9)
+FILES_TIMEOUT_MS = 10000
+FILES_ALLOWED = ("ux0:", "ur0:", "uma0:", "imc0:", "xmc0:", "grw0:")
+S_IFDIR = 0o010000
+USBDEVFS_CLAIMINTERFACE = 0x8004550F
+USBDEVFS_RELEASEINTERFACE = 0x80045510
+USBDEVFS_BULK = 0xC0185502      # _IOWR('U', 2, struct usbdevfs_bulktransfer), 64-bit
+SCE_ERRORS = {
+    0x80010002: "no such file or folder",
+    0x80010005: "input/output error",
+    0x8001000D: "refused (only " + " ".join(FILES_ALLOWED) + ")",
+    0x80010011: "already exists",
+    0x80010014: "not a folder",
+    0x80010015: "is a folder",
+    0x80010016: "invalid request",
+    0x8001001C: "no space left",
+    0x8001003C: "timed out",
+    0x8001005A: "folder not empty",
+}
+
+
+def sce_error(code):
+    code &= 0xFFFFFFFF
+    return SCE_ERRORS.get(code, f"error 0x{code:08X}")
+
+
+class FilesError(VitaError):
+    def __init__(self, code, what):
+        super().__init__(f"{what}: {sce_error(code)}")
+        self.code = code & 0xFFFFFFFF
+
+
+def find_usb_device():
+    for node in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        if (read_sysfs(node + "/idVendor") == "054c"
+                and read_sysfs(node + "/idProduct") == "1337"):
+            bus, dev = read_sysfs(node + "/busnum"), read_sysfs(node + "/devnum")
+            if bus and dev:
+                return node, f"/dev/bus/usb/{int(bus):03d}/{int(dev):03d}"
+    return None, None
+
+
+class VitaFiles:
+    def __init__(self):
+        import ctypes
+        self.ctypes = ctypes
+        node, path = find_usb_device()
+        if not path:
+            raise VitaError("Vita not found (no 054c:1337). Is the plugin running? Check lsusb.")
+        intf = f"{node}/{os.path.basename(node)}:1.{FILES_IF}"
+        if read_sysfs(intf + "/bInterfaceClass") != "ff":
+            raise VitaError("the plugin has no file transfer (build 119 or newer needed; "
+                            "vitactl.py status shows the build)")
+        self.ep_in = self.ep_out = None
+        for ep in glob.glob(intf + "/ep_*"):
+            addr = int(read_sysfs(ep + "/bEndpointAddress") or "0", 16)
+            if read_sysfs(ep + "/type") == "Bulk":
+                if addr & 0x80:
+                    self.ep_in = addr
+                else:
+                    self.ep_out = addr
+        if self.ep_in is None or self.ep_out is None:
+            raise VitaError("the plugin's file interface has no bulk endpoints")
+        try:
+            self.fd = os.open(path, os.O_RDWR)
+        except PermissionError:
+            raise VitaError(f"no permission on {path}; {UDEV_HINT}")
+        try:
+            fcntl.ioctl(self.fd, USBDEVFS_CLAIMINTERFACE, struct.pack("I", FILES_IF))
+        except OSError as e:
+            os.close(self.fd)
+            raise VitaError(f"can't claim the file interface: {e}")
+        self.seq = int.from_bytes(os.urandom(4), "little") or 1
+        self.buf = ctypes.create_string_buffer(FILES_CHUNK)
+        self.ping()
+
+    def close(self):
+        try:
+            fcntl.ioctl(self.fd, USBDEVFS_RELEASEINTERFACE, struct.pack("I", FILES_IF))
+        except OSError:
+            pass
+        os.close(self.fd)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def _bulk(self, ep, length, timeout_ms):
+        # Mutable, so ioctl returns the byte count rather than a copy.
+        arg = bytearray(struct.pack("IIIxxxxQ", ep, length, timeout_ms,
+                                    self.ctypes.addressof(self.buf)))
+        try:
+            return fcntl.ioctl(self.fd, USBDEVFS_BULK, arg, True)
+        except TimeoutError:
+            raise FilesError(0x8001003C, "USB")
+        except OSError as e:
+            if e.errno == errno.ETIMEDOUT:
+                raise FilesError(0x8001003C, "USB")
+            if e.errno in (errno.ENODEV, errno.EPROTO, errno.ESHUTDOWN):
+                raise VitaError("the Vita went away (USB transfer opened, or unplugged)")
+            raise VitaError(f"USB transfer failed: {e}")
+
+    def send(self, data, timeout_ms=FILES_TIMEOUT_MS):
+        self.ctypes.memmove(self.buf, data, len(data))
+        n = self._bulk(self.ep_out, len(data), timeout_ms)
+        if n != len(data):
+            raise VitaError(f"USB: sent {n} of {len(data)} bytes")
+
+    def recv(self, n, timeout_ms=FILES_TIMEOUT_MS):
+        got = self._bulk(self.ep_in, n, timeout_ms)
+        return self.buf.raw[:got]
+
+    def recv_exact(self, n):
+        data = self.recv(n)
+        if len(data) != n:
+            raise VitaError(f"USB: got {len(data)} of {n} bytes")
+        return data
+
+    def request(self, op, path="", arg=0, flags=0, path2=None):
+        raw = path.encode("utf-8") + b"\0"
+        if path2 is not None:
+            raw += path2.encode("utf-8") + b"\0"
+        if len(raw) > FILES_PATH_MAX:
+            raise VitaError("path too long")
+        # Sent twice at most: right after a push that was interrupted, the
+        # plugin still waits up to 5 s for that push's data and takes this
+        # request for it; it then drops the push and listens again. (The
+        # first try was not carried out then, so trying again is safe; at
+        # worst a retried rm/mv/push reports "no such file" or "exists".)
+        for attempt in (1, 2):
+            self.seq = (self.seq + 1) & 0xFFFFFFFF
+            pkt = struct.pack("<IIIIQII", FILES_REQ_MAGIC, self.seq, op, flags, arg,
+                              len(raw), 0) + raw
+            try:
+                self.send(pkt.ljust(FILES_REQ_SIZE, b"\0"))
+                return self.response(timeout_s=6 if attempt == 1 else 12)
+            except FilesError as e:
+                if e.code != 0x8001003C or attempt == 2:
+                    raise
+
+    def response(self, timeout_s=15):
+        """The response to the last request. Anything else arriving first (data
+        of a transfer an earlier command gave up) is skipped."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            left_ms = int((deadline - time.monotonic()) * 1000)
+            if left_ms <= 0:
+                break
+            try:
+                data = self.recv(512, timeout_ms=max(left_ms, 50))
+            except FilesError as e:
+                if e.code != 0x8001003C:
+                    raise
+                break
+            if len(data) == FILES_RESP_SIZE:
+                magic, seq, status, mode, size = struct.unpack_from("<IIiIQ", data)
+                if magic == FILES_RESP_MAGIC and seq == self.seq:
+                    y, mo, d, h, mi, sec = struct.unpack_from("<HBBBBB", data, 24)
+                    return {"status": status, "mode": mode, "size": size,
+                            "mtime": f"{y:04d}-{mo:02d}-{d:02d} {h:02d}:{mi:02d}" if y else ""}
+        raise FilesError(0x8001003C, "no answer from the plugin")
+
+    def check(self, r, what):
+        if r["status"] < 0:
+            raise FilesError(r["status"], what)
+        return r
+
+    def ping(self):
+        r = self.request(OP_PING)
+        if r["status"] != 0 or r["size"] != 1:
+            raise VitaError(f"unexpected file protocol {r['size']} (this vitactl.py speaks 1)")
+
+    def stat(self, path):
+        """The file or folder's details, or None if it doesn't exist."""
+        r = self.request(OP_STAT, path)
+        if r["status"] == -0x7FFEFFFE:        # 0x80010002, not found
+            return None
+        r = self.check(r, path)
+        r["is_dir"] = bool(r["mode"] & S_IFDIR)
+        return r
+
+    def list(self, path):
+        r = self.check(self.request(OP_LIST, path), path)
+        data = self.recv_exact(r["size"]) if r["size"] else b""
+        entries, off = [], 0
+        while off < len(data):
+            name_len, is_dir, _, _, size = struct.unpack_from("<HBBIQ", data, off)
+            y, mo, d, h, mi, sec = struct.unpack_from("<HBBBBB", data, off + 16)
+            name = data[off + 24:off + 24 + name_len].decode("utf-8", "replace")
+            entries.append({"name": name, "is_dir": bool(is_dir), "size": size,
+                            "mtime": f"{y:04d}-{mo:02d}-{d:02d} {h:02d}:{mi:02d}" if y else ""})
+            off += 24 + name_len
+        return entries, bool(r["mode"] & 0x80000000)
+
+    def get(self, path, out, progress):
+        r = self.check(self.request(OP_GET, path), path)
+        left = r["size"]
+        progress.start(left)
+        while left:
+            n = min(left, FILES_CHUNK)
+            out.write(self.recv_exact(n))
+            left -= n
+            progress.add(n)
+        return r["size"]
+
+    def put(self, path, src, size, overwrite, progress):
+        r = self.request(OP_PUT, path, size, FILES_OVERWRITE if overwrite else 0)
+        self.check(r, path)
+        progress.start(size)
+        left = size
+        while left:
+            n = min(left, FILES_CHUNK)
+            data = src.read(n)
+            if len(data) != n:
+                raise VitaError(f"{path}: the local file changed while being sent")
+            self.send(data)
+            left -= n
+            progress.add(n)
+        self.check(self.response(timeout_s=60), path)
+
+    def simple(self, op, path, what, flags=0, path2=None):
+        return self.check(self.request(op, path, flags=flags, path2=path2), what)
+
+
+class Progress:
+    """Bytes and MB/s on stderr while a transfer runs, then one summary line."""
+
+    def __init__(self, label):
+        self.label, self.total, self.done, self.t0, self.shown = label, 0, 0, 0.0, 0.0
+
+    def start(self, total):
+        self.total, self.done, self.t0 = total, 0, time.monotonic()
+
+    def add(self, n):
+        self.done += n
+        now = time.monotonic()
+        if sys.stderr.isatty() and now - self.shown > 0.3:
+            self.shown = now
+            print(f"\r{self.label}: {mib(self.done)} / {mib(self.total)}  "
+                  f"{self.rate():.1f} MB/s ", end="", file=sys.stderr, flush=True)
+
+    def rate(self):
+        dt = time.monotonic() - self.t0
+        return self.done / dt / 1e6 if dt > 0 else 0.0
+
+    def finish(self):
+        if sys.stderr.isatty():
+            print("\r\033[K", end="", file=sys.stderr)
+        dt = time.monotonic() - self.t0
+        print(f"{self.label}: {self.done} bytes in {dt:.1f} s ({self.rate():.1f} MB/s)")
+
+
+def mib(n):
+    return f"{n / 1048576:.1f} MiB"
+
+
+def remote_join(base, name):
+    return base + name if base.endswith((":", "/")) else base + "/" + name
+
+
+def remote_name(path):
+    return path.rstrip("/").split("/")[-1].split(":")[-1]
+
+
+def confirm(question, yes):
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        raise VitaError(f"{question}: not done (no terminal to confirm; add --yes)")
+    return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+
+
+def describe(st):
+    kind = "folder" if st["is_dir"] else f"{st['size']} bytes"
+    return f"{kind}, {st['mtime']}" if st["mtime"] else kind
+
+
+def cmd_ls(v, path):
+    entries, truncated = v.list(path)
+    for e in sorted(entries, key=lambda e: (not e["is_dir"], e["name"].lower())):
+        size = "<dir>" if e["is_dir"] else str(e["size"])
+        print(f"{size:>12}  {e['mtime']:16}  {e['name']}{'/' if e['is_dir'] else ''}")
+    if truncated:
+        print("(listing cut: too many entries)")
+
+
+def cmd_stat(v, path):
+    st = v.stat(path)
+    if st is None:
+        raise VitaError(f"{path}: {sce_error(0x80010002)}")
+    print(f"{path}: {describe(st)}")
+
+
+def pull_file(v, remote, local, yes):
+    if os.path.isdir(local):
+        local = os.path.join(local, remote_name(remote))
+    if os.path.exists(local) and not confirm(f"replace local {local}", yes):
+        raise VitaError("not done")
+    tmp = local + ".vstmp"
+    progress = Progress(f"pull {remote}")
+    try:
+        with open(tmp, "wb") as out:
+            v.get(remote, out, progress)
+        os.replace(tmp, local)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    progress.finish()
+
+
+def cmd_pull(v, args, yes, recursive):
+    if not 1 <= len(args) <= 2:
+        raise VitaError("usage: pull [-r] REMOTE [LOCAL]")
+    remote = args[0]
+    local = args[1] if len(args) == 2 else "."
+    st = v.stat(remote)
+    if st is None:
+        raise VitaError(f"{remote}: {sce_error(0x80010002)}")
+    if not st["is_dir"]:
+        pull_file(v, remote, local, yes)
+        return
+    if not recursive:
+        raise VitaError(f"{remote} is a folder: pull -r")
+    root = os.path.join(local, remote_name(remote)) if os.path.isdir(local) else local
+    # List everything first: nothing is written if a single local file exists.
+    plan, todo = [], [(remote, root)]
+    while todo:
+        rdir, ldir = todo.pop()
+        plan.append(("dir", rdir, ldir))
+        entries, truncated = v.list(rdir)
+        if truncated:
+            raise VitaError(f"{rdir}: too many entries to list")
+        for e in entries:
+            r, l = remote_join(rdir, e["name"]), os.path.join(ldir, e["name"])
+            if e["is_dir"]:
+                todo.append((r, l))
+            else:
+                plan.append(("file", r, l))
+    conflicts = [l for kind, _, l in plan if kind == "file" and os.path.exists(l)]
+    if conflicts:
+        raise VitaError("pull -r never replaces files; these exist already:\n  "
+                        + "\n  ".join(conflicts))
+    for kind, r, l in plan:
+        if kind == "dir":
+            os.makedirs(l, exist_ok=True)
+        else:
+            pull_file(v, r, l, False)
+
+
+def push_file(v, local, remote, yes):
+    size = os.path.getsize(local)
+    st = v.stat(remote)
+    overwrite = False
+    if st is not None:
+        if st["is_dir"]:
+            raise VitaError(f"{remote}: {sce_error(0x80010015)}")
+        if not confirm(f"replace {remote} ({describe(st)}) with {local} ({size} bytes)", yes):
+            raise VitaError("not done")
+        overwrite = True
+    progress = Progress(f"push {remote}")
+    with open(local, "rb") as src:
+        v.put(remote, src, size, overwrite, progress)
+    progress.finish()
+    after = v.stat(remote)
+    if after is None or after["size"] != size:
+        raise VitaError(f"{remote}: size on the Vita doesn't match ({after and after['size']} "
+                        f"for {size})")
+
+
+def cmd_push(v, args, yes, recursive):
+    if len(args) != 2:
+        raise VitaError("usage: push [-r] LOCAL REMOTE")
+    local, remote = args
+    if not os.path.exists(local):
+        raise VitaError(f"{local}: no such local file or folder")
+    target = v.stat(remote)
+    into = remote.endswith((":", "/")) or (target is not None and target["is_dir"])
+    if not os.path.isdir(local):
+        if into:
+            remote = remote_join(remote, os.path.basename(local))
+        push_file(v, local, remote, yes)
+        return
+    if not recursive:
+        raise VitaError(f"{local} is a folder: push -r")
+    root = remote_join(remote, os.path.basename(os.path.normpath(local))) if into else remote
+    # Check every destination first: push -r only creates, it never replaces.
+    plan, conflicts = [], []
+    for ldir, dirs, files in os.walk(local):
+        dirs.sort()
+        rel = os.path.relpath(ldir, local)
+        rdir = root if rel == "." else remote_join(root, rel.replace(os.sep, "/"))
+        plan.append(("dir", None, rdir))
+        for f in sorted(files):
+            r = remote_join(rdir, f)
+            if v.stat(r) is not None:
+                conflicts.append(r)
+            plan.append(("file", os.path.join(ldir, f), r))
+    if conflicts:
+        raise VitaError("push -r never replaces files; these exist already:\n  "
+                        + "\n  ".join(conflicts))
+    for kind, l, r in plan:
+        if kind == "dir":
+            st = v.stat(r)
+            if st is None:
+                v.simple(OP_MKDIR, r, r)
+            elif not st["is_dir"]:
+                raise VitaError(f"{r}: exists and is not a folder")
+        else:
+            push_file(v, l, r, False)
+
+
+def cmd_rm(v, path, yes):
+    st = v.stat(path)
+    if st is None:
+        raise VitaError(f"{path}: {sce_error(0x80010002)}")
+    if st["is_dir"]:
+        raise VitaError(f"{path} is a folder: rmdir (empty folders only)")
+    if not confirm(f"delete {path} ({describe(st)})", yes):
+        raise VitaError("not done")
+    v.simple(OP_REMOVE, path, path)
+    print(f"deleted {path}")
+
+
+def cmd_rmdir(v, path, yes):
+    st = v.stat(path)
+    if st is None:
+        raise VitaError(f"{path}: {sce_error(0x80010002)}")
+    if not st["is_dir"]:
+        raise VitaError(f"{path} is a file: rm")
+    entries, _ = v.list(path)
+    if entries:
+        raise VitaError(f"{path}: {sce_error(0x8001005A)} ({len(entries)} entries); "
+                        "only empty folders are deleted")
+    if not confirm(f"delete the empty folder {path}", yes):
+        raise VitaError("not done")
+    v.simple(OP_RMDIR, path, path)
+    print(f"deleted {path}")
+
+
+def cmd_mv(v, old, new, yes):
+    if v.stat(old) is None:
+        raise VitaError(f"{old}: {sce_error(0x80010002)}")
+    st = v.stat(new)
+    flags = 0
+    if st is not None:
+        if st["is_dir"]:
+            raise VitaError(f"{new}: {sce_error(0x80010015)}")
+        if not confirm(f"replace {new} ({describe(st)}) with {old}", yes):
+            raise VitaError("not done")
+        flags = FILES_OVERWRITE
+    v.simple(OP_RENAME, old, old, flags=flags, path2=new)
+    print(f"{old} -> {new}")
+
+
+FILE_COMMANDS = ("ls", "stat", "pull", "push", "rm", "rmdir", "mkdir", "mv")
+
+
+def run_file_command(cmd, args):
+    yes = "--yes" in args
+    recursive = "-r" in args
+    args = [a for a in args if a not in ("--yes", "-r")]
+    if recursive and cmd not in ("pull", "push"):
+        raise VitaError(f"{cmd} has no -r (nothing is deleted recursively)")
+    with VitaFiles() as v:
+        if cmd == "ls":
+            cmd_ls(v, args[0] if args else "ux0:")
+        elif cmd == "pull":
+            cmd_pull(v, args, yes, recursive)
+        elif cmd == "push":
+            cmd_push(v, args, yes, recursive)
+        elif len(args) != (2 if cmd == "mv" else 1):
+            raise VitaError(f"usage: {cmd} " + ("OLD NEW" if cmd == "mv" else "PATH"))
+        elif cmd == "stat":
+            cmd_stat(v, args[0])
+        elif cmd == "rm":
+            cmd_rm(v, args[0], yes)
+        elif cmd == "rmdir":
+            cmd_rmdir(v, args[0], yes)
+        elif cmd == "mkdir":
+            v.simple(OP_MKDIR, args[0], args[0])
+            print(f"created {args[0]}")
+        elif cmd == "mv":
+            cmd_mv(v, args[0], args[1], yes)
+
+
 # ---- dispatch ----
 
 def run_command(argv):
@@ -1080,6 +1601,9 @@ def run_command(argv):
     cmd, args = argv[0].lower(), argv[1:]
     if cmd in INPUT_COMMANDS:
         log_input(argv)
+    if cmd in FILE_COMMANDS:
+        run_file_command(cmd, args)
+        return
     if cmd == "watch":
         sub = args[0] if args else ""
         if sub == "start":

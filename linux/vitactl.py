@@ -3,8 +3,8 @@
 send it buttons, sticks and touches over USB.
 
   vitactl.py watch start|stop|status   keep the screen in latest.png (3 fps)
-             start --size WxH          video size: 960x544 (default, ~47 frames/s),
-                                       896x504 (54), 864x488 (57), 480x272 (60);
+             start --size WxH          video size: 960x544 (default, ~53 frames/s),
+                                       896x504, 864x488, 480x272 (60);
                                        shots are always 960x544
              start --audio             also the Vita's sound (plugin build 101+),
                                        kept with the video for `record`; the Vita
@@ -93,7 +93,8 @@ AUDIO_DEVICE = "hw:CARD=PSVita,DEV=0"   # the plugin's USB sound card (build 101
 # picture".
 AUDIO_DELAY_S = 0.017
 # Sizes the plugin offers (scaled by the Vita's hardware), with the frames/s
-# measured over USB 2: 960x544 47, 896x504 54, 864x488 57, 480x272 60.
+# measured over USB 2 with plugin build 117: 960x544 53, 896x504 60,
+# 864x488 60, 480x272 60 (builds 116 and older: 47, 54, 57, 60).
 # (Plugin builds before 106 also offered 1280x720: upscaled, 30 frames/s at
 # most, and the size being started when an experimental build hung.)
 VIDEO_SIZES = ("960x544", "896x504", "864x488", "480x272")

@@ -83,15 +83,17 @@ screen, records it, and sends input.
    ./linux/vitactl.py watch stop
    ```
 
-Video sizes and the frames per second measured over USB 2 (2026-11-22). Shots are
-always 960x544 (scaled up); recordings keep the real size.
+Video sizes and the frames per second measured over USB 2 (plugin build 117,
+2026-11-26). Shots are always 960x544 (scaled up); recordings keep the real size.
 
 | `--size` | frames/s |
 |---|---|
-| 960x544 (default) | 47 |
-| 896x504 | 54 |
-| 864x488 | 57 |
+| 960x544 (default) | 53 |
+| 896x504 | 60 |
+| 864x488 | 60 |
 | 480x272 | 60 |
+
+Plugin builds 116 and older were slower: 47, 54, 57 and 60.
 
 Plugin builds before 106 also offered 1280x720 (upscaled, 30 frames/s at most);
 it was removed (see TODO.md).

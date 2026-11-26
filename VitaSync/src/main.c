@@ -69,6 +69,14 @@ static volatile unsigned int bc_ep0_head;
 
 #define MAX_UVC_VIDEO_FRAME_SIZE	VIDEO_FRAME_SIZE_NV12(960, 544)
 
+/* Wait between the IFTU conversion and the USB send. Builds up to 115
+ * waited 2000 us (kept from the build that hid audio in the frames).
+ * Build 102 found the conversion finished when ksceIftuCsc returns (no torn
+ * frame on a fast scroll) and gained up to 13 frames/s without it, but
+ * stop/starts then hung; build 115's stop detection removed the stuck frame
+ * behind that. 0 since build 117; 2000 brings the old behaviour back. */
+#define IFTU_WAIT_US			0
+
 #define UVC_PAYLOAD_HEADER_SIZE		12
 #define UVC_PAYLOAD_SIZE(frame_size)	(UVC_PAYLOAD_HEADER_SIZE + (frame_size))
 #define MAX_UVC_PAYLOAD_TRANSFER_SIZE	UVC_PAYLOAD_SIZE(MAX_UVC_VIDEO_FRAME_SIZE)
@@ -972,11 +980,11 @@ static void pc_hid_send_input_heartbeat(void)
 	                         ((exit_phase & 3) << 6));
 	hb[63] =
 #ifdef USB_PROBE
-		116;
+		118;
 #else
-		115;
+		117;
 #endif
-	/* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture, 108 system event probe (test only), 109 = probe + 110's fix (test only), 110 no video frame pending at sleep/reboot, 111 steps aside for VitaShell's USB transfer (StopCurrentInternal hook), frame released at video stop, 112 USB probe (test only), 113 retake 5 s after MTP restarts, 114 = 113 + USB probe (test only), 115 video stop detected (frame unread 1 s), 116 = 115 + USB probe (test only) */
+	/* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture, 108 system event probe (test only), 109 = probe + 110's fix (test only), 110 no video frame pending at sleep/reboot, 111 steps aside for VitaShell's USB transfer (StopCurrentInternal hook), frame released at video stop, 112 USB probe (test only), 113 retake 5 s after MTP restarts, 114 = 113 + USB probe (test only), 115 video stop detected (frame unread 1 s), 116 = 115 + USB probe (test only), 117 no 2 ms wait after IFTU, 118 = 117 + USB probe (test only) */
 
 	ep2_try_send(hb);
 	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;
@@ -1677,10 +1685,9 @@ static int convert_and_send_frame_nv12(int fid, const SceDisplayFrameBufInfo *fb
 	if (ret < 0)
 		return ret;
 
-	/* IFTU is asynchronous: its DMA finishes writing the buffer after the
-	 * call returns. Wait before USB sends the frame. (Kept from the build
-	 * that embedded audio in the frames; untested without it.) */
-	ksceKernelDelayThreadCB(2000);
+	/* See IFTU_WAIT_US. */
+	if (IFTU_WAIT_US)
+		ksceKernelDelayThreadCB(IFTU_WAIT_US);
 
 	ret = uvc_frame_transfer(uvc_frame_buffer_addr,
 				 UVC_PAYLOAD_SIZE(VIDEO_FRAME_SIZE_NV12(dst_width, dst_height)),
@@ -1840,7 +1847,7 @@ static volatile unsigned int dbg_yield_n, dbg_yield_wait_ms, dbg_unyield_n;
 
 #ifdef USB_PROBE
 /*
- * USB probe (make PROBE=1, test only, build id 116). Build 111 still left
+ * USB probe (make PROBE=1, test only, build id 118). Build 111 still left
  * VitaShell stuck for ~30 s (PS frees it) when USB transfer opened or
  * closed after input sent into VitaShell during a capture. A first probe
  * with a status thread and a hook on the cable-state check never saw it
@@ -1963,7 +1970,7 @@ static void probe_install(void)
 
 	_Static_assert(sizeof(fns) / sizeof(fns[0]) == PROBE_HOOKS,
 		       "one hook function per probe_hooks entry");
-	n = snprintf(line, sizeof(line), "%8u probe build 116\n",
+	n = snprintf(line, sizeof(line), "%8u probe build 118\n",
 		     (unsigned int)(ksceKernelGetSystemTimeWide() / 1000));
 	probe_write(line, n, 1);
 	for (i = 0; i < PROBE_HOOKS; i++) {

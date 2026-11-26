@@ -180,8 +180,9 @@ Tell the user, in a few numbered lines:
    needs a reboot and henlo).
 2. **Video, then screen.** `$VITACTL watch start` (one attempt; if it fails,
    follow its advice, don't retry in a loop). The default 960x544 gives about
-   47 frames/s; to measure a 60 fps game, `--size 864x488` (57/s) or
-   `480x272` (60/s) instead (`watch stop` first to change size). When sound
+   53 frames/s (47 before plugin build 117); to measure a 60 fps game,
+   `--size 864x488` (60/s from build 117, 57/s before) or `480x272` (60/s)
+   instead (`watch stop` first to change size). When sound
    matters (plugin build 101+), add `--audio`: `record` then keeps the sound
    and `analyze` reports it. From plugin build 107 the Vita keeps playing its
    sound meanwhile (`status`: "Vita speaker"); with older builds, or if

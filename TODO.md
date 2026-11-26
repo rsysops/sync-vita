@@ -25,11 +25,11 @@ sound/picture offset (17 ms, `AUDIO_DELAY_S` in `vitactl.py`). Still to do:
   `watch start` runs records a frozen screen (sound capture wakes it since
   build 105; the video path doesn't).
 
-## Video: faster frames, and uvc_thread stalling after a stop
+## Video: frame rate, and uvc_thread stalling after a stop (both done)
 
-`uvc_frame_transfer`'s caller waits 2 ms after each IFTU conversion (from
-the build that hid audio in the frames). Experimental builds 102-104
-(2026-11-22, withdrawn; build 105 = 101's video path) found:
+`uvc_frame_transfer`'s caller waited 2 ms after each IFTU conversion (from
+the build that hid audio in the frames) until build 117. Experimental builds
+102-104 (2026-11-22, withdrawn; build 105 = 101's video path) found:
 
 - **Without the wait** (102): 960x544 went from 47 to 52 frames/s, 896x504
   to 59.6, 864x488 to 59.8, and a fast scroll showed no torn frame, so the
@@ -87,9 +87,16 @@ back after each, 60 s recording with sound on a still screen with no false
 stop (two 50 ms gaps), 480x272 at 60.1 frames/s, SELECT pressed from the PC
 right after a stop (mount 1.04 s), reboot after video.
 
-Next: remove the 2 ms wait after IFTU again (build 102 gave up to 59.8
-frames/s), now that a stop no longer leaves uvc_thread stuck: retest
-several stop/starts in a row first, which is what failed in 102.
+**Done in build 117: no more 2 ms wait** (`IFTU_WAIT_US` 0; 2000 brings
+it back). Tested 2026-11-26: 960x544 53.1 frames/s (was 47), 896x504 60.0
+(54), 864x488 60.0 (57), 480x272 60.1; no torn frame during LiveArea page
+swipes; 20 start/stops alternating 960x544 and 864x488, half restarted at
+once (inside the 1 s stop window), every start answered (102 failed
+there), heartbeat back after each stop; alive and taking input 2 min later;
+3 min with sound on a moving screen at 51.6 frames/s (ten 50 ms gaps);
+SELECT from the PC right after a stop; reboot after video. 102's failure
+was most likely the frame left queued after a stop, which a frame sent
+with no pause always is; build 115 releases it.
 
 ## Video: the Vita won't sleep during a capture
 

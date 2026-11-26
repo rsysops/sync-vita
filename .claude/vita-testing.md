@@ -45,16 +45,24 @@ Copy the `.skprx` to `downloads/`. The user then:
 
 The plugin takes over USB about 40 s after that (`lsusb`: `054c:1337`, video
 on the `/dev/video*` named "PSVita", HID on a `/dev/hidraw*`). With the
-release build, `vitactl.py status` shows the build number (110 as of
-2026-11-24).
+release build, `vitactl.py status` shows the build number (113 as of
+2026-11-26). The test flavour `./build-vita.sh PROBE=1` (build 114) logs every
+USB call to `ur0:data/VitaSync_probe.txt` (TODO.md).
 
-Opening VitaShell's USB transfer stops the plugin. Closing it brings the plugin
-back by itself within a few seconds (`1337` again), with no reboot needed.
+Opening VitaShell's USB transfer stops the plugin; the card mounts on the PC
+in about 1 s. Closing it brings the plugin back by itself about 5 s later
+(`1337` again), with no reboot needed.
 
-**Known issue (TODO.md):** once `vitactl.py` has sent input or run `status` in
-a boot, opening USB transfer can freeze the Vita, which crashes 30–60 s later.
-Video alone is fine. In such a boot, copy over VitaShell's FTP or reboot first.
-After a freeze: hold power to force it off.
+**USB transfer and the freeze (TODO.md):** up to build 110, opening USB
+transfer after a video capture froze the Vita until it was forced off (hold
+power). From build 111 it works after video and input. Twice (2026-11-25),
+VitaShell still hung ~30 s after input had been sent into it during a capture;
+PS frees it. After a hang while closing, the Vita hasn't re-read `ux0:`
+(files the PC copied don't show): reboot before writing to `ux0:`.
+
+**After `watch stop`, input is lost** until the next `watch start` or USB
+transfer: the plugin never sees the video stop (TODO.md). Send input before
+stopping the video, or with it running.
 
 ## Results
 
@@ -73,8 +81,8 @@ gamesd, PSVshell, kubridge). Nothing else on `ux0:` belongs to this project.
 ## What to test from
 
 `~/Desktop/vitasync-handoff.md`, "How to check it works". The end-to-end
-scenario (video, sound, input, FTP): `TESTING.md`. For the USB transfer freeze:
-`TODO.md`.
+scenario (video, sound, input, FTP): `TESTING.md`. For USB transfer and the
+freeze: `TODO.md`.
 
 ## Reading results
 

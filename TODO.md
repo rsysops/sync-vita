@@ -64,11 +64,21 @@ for good (a debug build that waited 500 ms there did). Debug builds can't
 be used to study a shutdown: their logger goes quiet ~60 s after the PC
 connects, and the shutdown then hangs too.
 
-Next: make a normal video stop clean the same way (check `stream` before
-each submit, cancel and release the wait from the abort path) before
-removing the 2 ms wait again. 103's crash came from cancelling on a timeout
-in uvc_thread, during streaming; the handler cancels from another thread,
-once nothing more is sent, which works.
+**Why a video stop is never seen (found 2026-11-25).** The video endpoint
+is bulk, so Linux's uvcvideo stops a stream with CLEAR_FEATURE(ENDPOINT_HALT)
+on EP 0x81, not SET_INTERFACE (`uvc_video_stop_streaming`). udcd handles that
+standard request itself and never passes it to `uvc_udcd_process_request`,
+so `uvc_handle_video_abort` doesn't run, `stream` stays 1 and the last frame
+stays queued (probe 112: `stream 1 wait 1 pend 1` tens of seconds after
+`watch stop`). Build 111 added the release (`uvc_frame_release`: cancel EP1,
+set the event flag) to the abort path, which therefore doesn't help here,
+and to the USB transfer yield, which does.
+
+Next: detect the stop another way, then remove the 2 ms wait again. Idea: a
+frame unread for over ~0.5 s means the PC stopped reading; release it from
+another thread than uvc_thread (as `sysevent_handler` and `usb_yield` do;
+103's crash came from cancelling in uvc_thread during streaming). That would
+also bring input back after `watch stop`.
 
 ## Video: the Vita won't sleep during a capture
 
@@ -80,83 +90,96 @@ likely the keep-awake ticks in uvc_thread (`ksceKernelPowerTick` every
 10 s while streaming) or the USB traffic itself. Harmless: `watch stop`
 first to put the Vita to sleep.
 
-## VitaShell's USB transfer freezes the Vita after the PC used the HID interface
+## VitaShell's USB transfer: fixed in build 111, one hang left
 
-**The problem.** With the plugin running, opening VitaShell's USB transfer
-(File Manager, SELECT) sometimes freezes the Vita; it crashes 30–60 s later.
-The PC never sees VitaShell's USB device (`054c:05d3`): the plugin's device
-(`054c:1337`) stays listed until the crash. So the freeze happens while
-VitaShell takes USB away from the plugin, before it hands the card to the PC.
+**Up to build 110.** With the plugin running, opening VitaShell's USB
+transfer (VitaDeploy > File Manager, SELECT) froze the Vita whenever a video
+capture had been started and stopped in that boot. It stayed frozen until
+forced off (it crashed on its own only once or twice). The PC kept seeing
+`054c:1337`. It was first blamed on HID use (table of 2026-11-21 in git
+history); on 2026-11-25 a plain `watch start` + `watch stop` was enough. And
+every USB transfer took ~15 s to mount instead of ~3 s.
 
-**Workaround (in place).** Don't open USB transfer in a boot where
-`vitactl.py` has sent input or run `status`. Video alone (`watch`, `shot`) is
-fine. To copy files in such a boot, use VitaShell's FTP, or reboot first.
+**What VitaShell does** (`usb.c` and `modules/usbdevice/main.c` in
+TheOfficialFloW/VitaShell; VitaDeploy just runs a stock VitaShell 2.02).
+Opening: `sceAppMgrDestroyOtherApp`, load `usbdevice.skprx` (its
+`module_start` calls `ksceUdcdStopCurrentInternal(2)`, which stops our
+driver), `sceMtpIfStopDriver(1)` (returns `0x8054360C`, accepted),
+`sceUsbstorVStorStart` (PC sees `054c:05d3`). Closing: `sceUsbstorVStorStop`,
+`sceMtpIfStartDriver(1)` (PC sees `04e4`), unload the module, then remount
+`ux0:` so the Vita sees what the PC wrote. `stopUsb()` returns early on any
+error and then skips the remount. VitaShell locks PS only once USB transfer
+is up.
 
-### What we know (2026-11-21)
+**Causes and fixes (build 111).**
 
-| Opening | Result | What the PC had done in that boot |
-|---|---|---|
-| 17:49, 17:53 (2nd of the boot, after a retake) | ok | video frame grabs only |
-| 18:07 | ok | video frame grabs only |
-| 18:53 | ok | `status` and inputs, but 30 min before; video running |
-| 19:12 | freeze | `status`, inputs, PS, then `watch stop` |
-| 19:14 | ok | nothing |
-| 19:18 (2nd of the boot) | freeze | `watch start`, `shot`, `status` seconds before |
-| 19:23 | ok | nothing |
-| 19:28 | freeze | `status`, `watch start`, `shot`, `status`, `watch stop` |
-| 19:34–19:37, 4 openings in one boot | ok | nothing (build 92: no retake) |
-| 19:48 | freeze | `status`, 2 presses, video running (build 93: no heartbeat) |
-| 20:01, 20:14 | freeze | same (build 94 debug, logging tests) |
+- **Freeze:** after `watch stop` the last frame stays queued on EP1 with
+  uvc_thread waiting on it (the stop is never seen, see "Video" above), and
+  VitaShell's stop hung on it, as reboots did before build 110. The plugin
+  now hooks `ksceUdcdStopCurrentInternal` (`SceUdcdForDriver` 0xBC05A8FB, NID
+  0x0F3595AE) and steps aside first (`usb_yield`): stops video, sound and
+  heartbeat, releases the frame, waits for uvc_thread (200 ms at most; a sound
+  request stays queued until the driver stops, so the wait always runs out),
+  cancels EP1-EP4, then answers nothing (`usb_yielded`) until `usb_retake`.
+- **Same path:** the video abort queued the EP3 receive a second time while
+  it was still queued (removed).
+- **15 s mount, two causes found with usbmon and `lsusb -v` (2026-11-25):**
+  our descriptor hook added the video IAD to every config descriptor,
+  VitaShell's storage one included (now only ours: `confdesc_hi/full`), and
+  udcd still calls our stopped driver, which took the storage request
+  GET_MAX_LUN (0xA1 0xFE, interface 0) for a UVC one and answered nothing:
+  the PC waited its 10 s timeout. Half of those mounts also logged `device
+  descriptor read ... error -32`. Now 1.0 s, no error.
+- **Build 113:** the retake waits 5 s of MTP running instead of 1.5 s, so
+  VitaShell can unload its module and remount `ux0:` first.
 
-Every freeze followed HID use (`status` or input commands, which open
-`/dev/hidraw*`) by the PC in the same boot. 18:53 is the one exception.
+Tested on 2026-11-25/26 (builds 111-113): capture then stop, recording with
+sound, video and sound running, input only, 10 start/stops, reboot after
+video, input into VitaShell during a capture (11 runs): no freeze but the
+one below.
 
-### Ruled out
+**Left: VitaShell hangs ~30 s.** Twice on 2026-11-25 (build 111), after
+input sent into VitaShell during a capture then `watch stop`, pressing
+SELECT left VitaShell stuck for ~30 s; the PC saw no change (so before our
+driver stopped), then VitaShell came back without USB transfer. PS frees it
+earlier, with its state intact. Once it hung while closing instead: the
+remount was skipped, and files the PC had copied didn't show until a reboot
+(writing to `ux0:` from the Vita in that state risks the card). Not seen
+again in the 11 runs that followed (2026-11-25 evening and 2026-11-26, builds
+111-114), including a replay of the boot that froze
+(soft reboot after 10 start/stops, input on LiveArea, a USB transfer, then
+the capture), on 111 and on the probes. Leads: something before
+`StopCurrentInternal` in VitaShell's sequence (`sceAppMgrDestroyOtherApp`,
+the module load), or a race with something on the PC side then (the PC has
+rebooted since).
 
-- **The plugin's retake** after USB transfer closes: first openings freeze too
-  (19:12, 19:28, 19:48), and a second opening after a retake worked (17:53).
-- **The heartbeat** (the only IN traffic on the HID interface): build 93 sent
-  none and still froze.
-- **A Linux MTP session:** `mtp-probe` reported "not an MTP device" each time;
-  nothing on the PC talked MTP to the Vita.
-- **Stopping MTP through the MTP service** (`sceMtpIfStopDriver`, NID
-  `0xC0CFA3BC` in module `SceMtpIfDriver`, library `0x5EFA4138`): it refuses
-  calls from kernel code with `0x80010058`, so it can't be used from the plugin.
+**If it comes back:** `./build-vita.sh PROBE=1` (build 114) logs each step
+of VitaShell's `startUsb()`/`stopUsb()` (MtpIf, VStor, AppMgr syscalls),
+every `ksceUdcdStart/Stop/Activate/Deactivate`, our yield and each change
+the retake check sees, with durations, to `ur0:data/VitaSync_probe.txt`
+(synced at once). Read it over VitaShell's FTP (`ur0:/data/`): USB transfer
+doesn't expose `ur0:`. A first probe with a status thread and a hook on the
+cable-state check (VitaShell polls it ~60 times a second while USB transfer
+is open) never saw the hang either; the `*Internal` udcd exports are never
+called, hook the public ones.
 
-### What to check next
+**Debug log** (`./build-vita.sh DEBUG=1`): it goes quiet ~25-60 s after the
+PC connects (logger thread blocked? `log_buf` full?), so it can't catch a
+hang; the probe writes its lines directly instead.
 
-1. **Video vs HID.** One boot with only `watch start`, 30 s of video,
-   `watch stop`, no HID use, then open USB transfer. A freeze there clears the
-   HID side and points at the video path (`uvc_handle_video_abort`,
-   `send_frame` waiting on `uvc_frame_req_evflag` without a timeout).
-2. **HID only.** One boot with `status` and a `press`, no video at all, then
-   open USB transfer.
-3. **Why the debug log goes quiet.** In builds 94 (`ur0:data/VitaSync_log.txt`,
-   written by a logger thread with `ksceIoSyncByFd`), the log stops about 25 s
-   after the PC connects, before any of our input or video traffic is recorded,
-   though the plugin handled both. Find out why (logger thread blocked? file
-   writes failing? `log_buf` full?) before relying on it to catch the freeze.
-   The breadcrumbs (`BC()` in `main.c`, debug builds only) record each step of
-   attach, detach, video abort, EP3 receives, EP0 requests and where
-   `uvc_thread` is.
-4. **Suspects in the plugin's USB shutdown path**, which runs inside
-   VitaShell's `ksceUdcdStopCurrentInternal(2)`:
-   - `uvc_handle_video_abort` calls `pc_hid_start_receive()` (queues a new EP3
-     receive) while the driver is being stopped;
-   - `usb_ep0_req_recv_on_complete` applies EP0 data without checking
-     `req->returnCode`;
-   - `uvc_frame_req_submit_phycont` waits for the frame transfer with no
-     timeout.
-5. **How VitaShell opens USB transfer** (`usb.c`, `modules/usbdevice/main.c`
-   in TheOfficialFloW/VitaShell): `taiLoadStartKernelModule(usbdevice.skprx)`
-   (its `module_start` calls `ksceUdcdStopCurrentInternal(2)`), then
-   `sceMtpIfStopDriver(1)`, then `sceUsbstorVStorStart`. Find which of these
-   never returns.
+## Next: VitaSync's own file transfer over USB
 
-To fetch a debug log after a freeze: boot with **L** held when leaving henlo's
-menu (so the plugin doesn't start a new log), copy `ur0:data/VitaSync_log.txt`
-to `ux0:` in VitaShell, then open USB transfer.
+File-level, not mass storage (the PC and the Vita would both write the same
+exFAT): a vendor bulk interface next to video, HID and sound, a plugin
+thread doing `ksceIoOpen/Read/Write`, and `vitactl.py ls/push/pull/rm` over
+usbdevfs (standard library only). It would work while a game runs, without
+VitaShell, and the vita-testing skill could deploy builds and fetch logs
+with no steps from the user. Needs its own plan.
 
-##
+## Small things
+
 * Rework readme (add a thank you section at the top to thank the original creator; ...)
-* Try to fix USB file transfert after recording
+* The USB product ID `0x1337` comes from vita-udcd-uvc (`UVC_USB_PID`); it
+  could become VitaSync's own (any value Sony doesn't use, e.g. `0x5653`).
+  Needs `vitactl.py` (`find_hidraw`), `linux/70-vitasync.rules` (reinstall)
+  and the docs.

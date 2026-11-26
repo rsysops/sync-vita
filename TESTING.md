@@ -20,8 +20,9 @@ report.
 
 - Every shot goes to `$DEST`, numbered: `$VITACTL shot "$DEST/01-<what>.png"`.
   Look at each one before the next input.
-- **This scenario sends input.** For the rest of the boot, files go over FTP
-  only: opening USB transfer can freeze the Vita (see [TODO.md](TODO.md)).
+- **This scenario sends input.** With plugin build 110 or older, files then go
+  over FTP only for the rest of the boot: opening USB transfer could freeze the
+  Vita. From build 111, USB transfer works after it (see [TODO.md](TODO.md)).
 - VitaShell is opened through the **VitaDeploy** app: VitaDeploy > File
   Manager. While its FTP server runs in the background, PS is locked until
   it's closed: SELECT brings the dialog back, and ○ Cancel disconnects.
@@ -173,4 +174,5 @@ A short message to the user:
 - a table: step, result (pass, fail or skipped), what the shot showed;
 - the folder with the shots (`$DEST`), and the shots that matter;
 - anything odd: slow or stale frames, an unexpected dialog, a slow FTP reply;
-- the end state: SELECT is set to FTP, and this boot is FTP only.
+- the end state: SELECT is set to FTP (and, with plugin build 110 or older,
+  this boot is FTP only).

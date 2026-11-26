@@ -111,7 +111,7 @@ arecord -D hw:CARD=PSVita,DEV=0 -f S16_LE -r 48000 -c 2 -d 10 sound.wav
 ```
 
 Opening VitaShell's USB transfer takes USB away from the plugin; it takes USB
-back by itself a few seconds after the transfer is closed.
+back by itself about 5 s after the transfer is closed.
 
 [TESTING.md](TESTING.md) is a test scenario that checks video, sound, input and
 VitaShell's FTP together.
@@ -120,10 +120,14 @@ VitaShell's FTP together.
 Vita, with or without `vitactl.py`. Install it by copying the folder to
 `~/.claude/skills/`; each project describes itself in `.claude/vita-testing.md`.
 
-> **Known issue:** once `vitactl.py` has sent input or run `status` in a boot,
-> opening VitaShell's USB transfer can freeze the Vita (it crashes 30–60 s
-> later). Video alone is fine. In such a boot, copy files over VitaShell's FTP,
-> or reboot before opening USB transfer. Details and leads in [TODO.md](TODO.md).
+> **Known issue:** up to build 110, opening VitaShell's USB transfer after a
+> video capture froze the Vita until it was forced off. Since build 111 the
+> plugin steps aside cleanly before VitaShell takes USB, and the card mounts in
+> about 1 s again (it took 11 s with the plugin before). Twice, on 2026-11-25,
+> VitaShell still hung for about 30 s after input had been sent into it during a
+> capture; PS gets you out. If that happens while closing USB transfer, the
+> Vita doesn't re-read the card: reboot before changing anything on `ux0:`.
+> Details in [TODO.md](TODO.md).
 
 ## ⚠️ Warning
 

@@ -57,18 +57,6 @@ struct bc_ep0_req {
 static struct bc_ep0_req bc_ep0_ring[BC_EP0_RING];
 static volatile unsigned int bc_ep0_head;
 #define BC(var, v)	((var) = (v))
-#elif defined(USB_PROBE)
-/* Probe builds keep only where uvc_thread is (written by the probe's
- * status thread); the other breadcrumbs cost nothing. */
-static volatile unsigned int bc_uvc_where;
-#define BC(var, v)		BC_##var(v)
-#define BC_bc_uvc_where(v)	(bc_uvc_where = (v))
-#define BC_bc_attach_step(v)	((void)0)
-#define BC_bc_detach_step(v)	((void)0)
-#define BC_bc_abort_n(v)	((void)0)
-#define BC_bc_abort_step(v)	((void)0)
-#define BC_bc_ep3_done_n(v)	((void)0)
-#define BC_bc_ep3_last_rc(v)	((void)0)
 #else
 #define BC(var, v)	((void)0)
 #endif
@@ -981,11 +969,11 @@ static void pc_hid_send_input_heartbeat(void)
 	                         ((exit_phase & 3) << 6));
 	hb[63] =
 #ifdef USB_PROBE
-		112;
+		114;
 #else
-		111;
+		113;
 #endif
-	/* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture, 108 system event probe (test only), 109 = probe + 110's fix (test only), 110 no video frame pending at sleep/reboot, 111 steps aside for VitaShell's USB transfer (StopCurrentInternal hook), frame released at video stop, 112 = 111 + USB probe (test only) */
+	/* build id: 90 PS, 91 all inputs, 95 debug breadcrumbs, 96 USB audio (silence), 97 Vita sound, 101 one audio request in flight, 105 = 101 + awake during sound capture (102-104 withdrawn: video hangs), 106 no 1280x720, 107 speaker plays during sound capture, 108 system event probe (test only), 109 = probe + 110's fix (test only), 110 no video frame pending at sleep/reboot, 111 steps aside for VitaShell's USB transfer (StopCurrentInternal hook), frame released at video stop, 112 USB probe (test only), 113 retake 5 s after MTP restarts, 114 = 113 + USB probe (test only) */
 
 	ep2_try_send(hb);
 	touch_patched_reads[SCE_TOUCH_PORT_FRONT] = 0;
@@ -1848,28 +1836,22 @@ static volatile unsigned int dbg_yield_n, dbg_yield_wait_ms, dbg_unyield_n;
 
 #ifdef USB_PROBE
 /*
- * USB probe (make PROBE=1, test only, build id 112). Build 111 still froze
- * once for 30-60 s when USB transfer opened after video + input, then
- * VitaShell came back without USB transfer. Every udcd start, stop,
- * activate and deactivate (ours, VitaShell's, VStor's, MTP's) is written
- * to ur0:data/VitaSync_probe.txt with its duration and our state, synced
- * at once so a forced power-off keeps it. Not while the system goes down
- * (file IO blocks a shutdown, build 110).
+ * USB probe (make PROBE=1, test only, build id 114). Build 111 still left
+ * VitaShell stuck for ~30 s (PS frees it) when USB transfer opened or
+ * closed after input sent into VitaShell during a capture. A first probe
+ * with a status thread and a hook on the cable-state check never saw it
+ * happen (4 tries), so this one only writes a line when something is
+ * called: the steps of VitaShell's startUsb()/stopUsb(), every udcd
+ * start/stop/activate/deactivate (ours, VStor's, MTP's), our yield, and
+ * each change the retake check sees. Lines go to
+ * ur0:data/VitaSync_probe.txt, synced at once so a forced power-off keeps
+ * them. Not while the system goes down (file IO blocks a shutdown).
  */
 #include <psp2kern/io/fcntl.h>
 #include <psp2kern/io/stat.h>
 #include <stdio.h>
 
 #define PROBE_FILE	"ur0:data/VitaSync_probe.txt"
-
-#define PROBE_HOOKS	7
-static SceUID probe_hook_uid[PROBE_HOOKS] = { -1, -1, -1, -1, -1, -1, -1 };
-static tai_hook_ref_t probe_ref[PROBE_HOOKS];
-static SceUID probe_thread_id = -1;
-static volatile int probe_run;
-/* Device state reads since the last status line, from VitaShell
- * (sceUdcdGetDeviceState) and from the kernel (Internal). */
-static volatile unsigned int probe_state_user_n, probe_state_kernel_n;
 
 static void probe_write(const char *buf, int len, int truncate)
 {
@@ -1907,184 +1889,93 @@ static void probe_write(const char *buf, int len, int truncate)
 	} \
 } while (0)
 
-/* The original (or the next hook in the chain), as the hooks above do. */
-#define PROBE_NEXT(i, type) \
-	(((struct _tai_hook_user *)probe_ref[i])->next ? \
-	 (type)((struct _tai_hook_user *)((struct _tai_hook_user *)probe_ref[i])->next)->func : \
-	 (type)((struct _tai_hook_user *)probe_ref[i])->old)
+/*
+ * One pass-through hook per function: up to 4 arguments go through
+ * unchanged (all of these take 0 to 3). A line before and after, with the
+ * time the call took. arg 0 is shown as a string for ksceUdcdStart/Stop
+ * (a kernel pointer to the driver name), as a number otherwise.
+ */
+struct probe_hook {
+	const char *module;
+	unsigned int lib, nid;
+	const char *name;
+	int name_arg;		/* arg 0 is the driver name */
+};
 
-static int probe_start(const char *name, int size, void *args, int bus)
+static const struct probe_hook probe_hooks[] = {
+	{ "SceUdcd", 0xBC05A8FB, 0x9FD733EA, "ksceUdcdStart", 1 },
+	{ "SceUdcd", 0xBC05A8FB, 0x1494293B, "ksceUdcdStop", 1 },
+	{ "SceUdcd", 0xBC05A8FB, 0x4FDEA423, "ksceUdcdActivate", 0 },
+	{ "SceUdcd", 0xBC05A8FB, 0x8AE87657, "ksceUdcdDeactivate", 0 },
+	{ "SceMtpIfDriver", 0x5EFA4138, 0xC5327CAC, "sceMtpIfStartDriver", 0 },
+	{ "SceMtpIfDriver", 0x5EFA4138, 0xC0CFA3BC, "sceMtpIfStopDriver", 0 },
+	{ "SceUsbstorVStorDriver", 0x17F294B9, 0xB606F1AF, "sceUsbstorVStorStart", 0 },
+	{ "SceUsbstorVStorDriver", 0x17F294B9, 0x0FD67059, "sceUsbstorVStorStop", 0 },
+	{ "SceAppMgr", 0x8AF17416, 0x3EF143BF, "sceAppMgrDestroyOtherApp", 0 },
+};
+#define PROBE_HOOKS	(sizeof(probe_hooks) / sizeof(probe_hooks[0]))
+
+static SceUID probe_hook_uid[PROBE_HOOKS];
+static tai_hook_ref_t probe_ref[PROBE_HOOKS];
+
+typedef int (*probe_fn)(int, int, int, int);
+
+static int probe_call(int i, int a0, int a1, int a2, int a3)
 {
+	const struct probe_hook *h = &probe_hooks[i];
+	struct _tai_hook_user *cur = (struct _tai_hook_user *)probe_ref[i];
+	struct _tai_hook_user *nxt = (struct _tai_hook_user *)cur->next;
 	SceUInt64 t = ksceKernelGetSystemTimeWide();
 	int ret;
 
-	PROBE("> StartInternal(%s, bus %d)", name ? name : "?", bus);
-	ret = PROBE_NEXT(0, int (*)(const char *, int, void *, int))(name, size, args, bus);
-	PROBE("< StartInternal(%s) = 0x%08X in %u ms", name ? name : "?", ret,
+	if (h->name_arg && a0)
+		PROBE("> %s(%s)", h->name, (const char *)a0);
+	else
+		PROBE("> %s(0x%X)", h->name, a0);
+	ret = nxt ? ((probe_fn)nxt->func)(a0, a1, a2, a3)
+		  : ((probe_fn)cur->old)(a0, a1, a2, a3);
+	PROBE("< %s = 0x%08X in %u ms", h->name, ret,
 	      (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000));
 	return ret;
 }
 
-static int probe_stop(const char *name, int size, void *args, int bus)
-{
-	SceUInt64 t = ksceKernelGetSystemTimeWide();
-	int ret;
-
-	PROBE("> StopInternal(%s, bus %d)", name ? name : "?", bus);
-	ret = PROBE_NEXT(1, int (*)(const char *, int, void *, int))(name, size, args, bus);
-	PROBE("< StopInternal(%s) = 0x%08X in %u ms", name ? name : "?", ret,
-	      (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000));
-	return ret;
-}
-
-static int probe_activate(unsigned int pid, unsigned int bus_powered, int bus)
-{
-	SceUInt64 t = ksceKernelGetSystemTimeWide();
-	int ret;
-
-	PROBE("> ActivateInternal(0x%04X, bus %d)", pid, bus);
-	ret = PROBE_NEXT(2, int (*)(unsigned int, unsigned int, int))(pid, bus_powered, bus);
-	PROBE("< ActivateInternal(0x%04X) = 0x%08X in %u ms", pid, ret,
-	      (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000));
-	return ret;
-}
-
-static int probe_deactivate(int bus)
-{
-	SceUInt64 t = ksceKernelGetSystemTimeWide();
-	int ret;
-
-	PROBE("> DeactivateInternal(bus %d)", bus);
-	ret = PROBE_NEXT(3, int (*)(int))(bus);
-	PROBE("< DeactivateInternal = 0x%08X in %u ms", ret,
-	      (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000));
-	return ret;
-}
-
-static int probe_start_current(int unused, int bus)
-{
-	SceUInt64 t = ksceKernelGetSystemTimeWide();
-	int ret;
-
-	PROBE("> StartCurrentInternal(bus %d)", bus);
-	ret = PROBE_NEXT(4, int (*)(int, int))(unused, bus);
-	PROBE("< StartCurrentInternal = 0x%08X in %u ms", ret,
-	      (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000));
-	return ret;
-}
-
-/* VitaShell checks the cable with this before starting USB transfer, and
- * polls it while USB transfer is open. Logged when slower than 50 ms. */
-static int probe_state_user(void *state)
-{
-	SceUInt64 t = ksceKernelGetSystemTimeWide();
-	unsigned int ms;
-	int ret;
-
-	probe_state_user_n++;
-	ret = PROBE_NEXT(5, int (*)(void *))(state);
-	ms = (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000);
-	if (ms > 50)
-		PROBE("  sceUdcdGetDeviceState (VitaShell) = 0x%08X took %u ms",
-		      ret, ms);
-	return ret;
-}
-
-static int probe_state_kernel(int bus)
-{
-	SceUInt64 t = ksceKernelGetSystemTimeWide();
-	unsigned int ms;
-	int ret;
-
-	probe_state_kernel_n++;
-	ret = PROBE_NEXT(6, int (*)(int))(bus);
-	ms = (unsigned int)((ksceKernelGetSystemTimeWide() - t) / 1000);
-	if (ms > 50)
-		PROBE("  GetDeviceStateInternal(bus %d) = 0x%08X took %u ms",
-		      bus, ret, ms);
-	return ret;
-}
-
-/* A status line each second while anything in it changes, else every
- * 10 s: where uvc_thread is (1 waits for a vblank, 3 sends a frame, 5
- * waits for a frame to complete, 6 frame done, 7-8 retake), the buttons
- * the kernel sees, and how often the device state was read. */
-static int probe_thread(SceSize args, void *argp)
-{
-	unsigned int last[6] = { ~0u, ~0u, ~0u, ~0u, ~0u, ~0u };
-	int ticks = 0;
-
-	(void)args; (void)argp;
-	while (probe_run) {
-		SceCtrlData pad;
-		unsigned int now[6];
-
-		memset(&pad, 0, sizeof(pad));
-		ksceCtrlPeekBufferPositive(0, &pad, 1);
-		now[0] = bc_uvc_where;
-		now[1] = pad.buttons;
-		now[2] = (stream << 0) | (usb_yielded << 1) |
-			 (usb_driver_running << 2) | (pc_control_active << 3) |
-			 (uvc_busy << 4) | (uvc_frame_waiting << 5);
-		now[3] = probe_attach_n + probe_detach_n * 256;
-		now[4] = probe_state_user_n ? 1 : 0;
-		now[5] = probe_drv_start_n + probe_drv_stop_n * 256;
-		if (memcmp(now, last, sizeof(now)) != 0 || ++ticks >= 10) {
-			PROBE("tick: uvc_thread at %u, buttons 0x%08X, state reads "
-			      "%u user %u kernel", now[0], now[1],
-			      probe_state_user_n, probe_state_kernel_n);
-			probe_state_user_n = 0;
-			probe_state_kernel_n = 0;
-			memcpy(last, now, sizeof(now));
-			ticks = 0;
-		}
-		ksceKernelDelayThread(1000000);
-	}
-	return 0;
-}
+#define PROBE_HOOK_FN(i) \
+	static int probe_hook_##i(int a0, int a1, int a2, int a3) \
+	{ return probe_call(i, a0, a1, a2, a3); }
+PROBE_HOOK_FN(0) PROBE_HOOK_FN(1) PROBE_HOOK_FN(2) PROBE_HOOK_FN(3)
+PROBE_HOOK_FN(4) PROBE_HOOK_FN(5) PROBE_HOOK_FN(6) PROBE_HOOK_FN(7)
+PROBE_HOOK_FN(8)
 
 static void probe_install(void)
 {
-	static const struct { unsigned int lib, nid; void *func; } h[PROBE_HOOKS] = {
-		{ 0xBC05A8FB, 0x90F8BCAE, probe_start },	/* ksceUdcdStartInternal */
-		{ 0xBC05A8FB, 0x150FD3BB, probe_stop },		/* ksceUdcdStopInternal */
-		{ 0xBC05A8FB, 0x9119247B, probe_activate },	/* ksceUdcdActivateInternal */
-		{ 0xBC05A8FB, 0xFDC10F93, probe_deactivate },	/* ksceUdcdDeactivateInternal */
-		{ 0xBC05A8FB, 0x360E95B9, probe_start_current },/* ksceUdcdStartCurrentInternal */
-		{ 0xA84BDE8A, 0xFCD31220, probe_state_user },	/* sceUdcdGetDeviceState (syscall) */
-		{ 0xBC05A8FB, 0x409DD196, probe_state_kernel },	/* ksceUdcdGetDeviceStateInternal */
+	static const probe_fn fns[] = {
+		probe_hook_0, probe_hook_1, probe_hook_2, probe_hook_3,
+		probe_hook_4, probe_hook_5, probe_hook_6, probe_hook_7,
+		probe_hook_8,
 	};
-	char line[200];
-	int i, n;
+	char line[160];
+	unsigned int i;
+	int n;
 
-	for (i = 0; i < PROBE_HOOKS; i++)
-		probe_hook_uid[i] = taiHookFunctionExportForKernel(KERNEL_PID,
-			&probe_ref[i], "SceUdcd", h[i].lib, h[i].nid, h[i].func);
-	n = snprintf(line, sizeof(line), "%8u probe build 112: hooks 0x%08X 0x%08X "
-		     "0x%08X 0x%08X 0x%08X 0x%08X 0x%08X\n",
-		     (unsigned int)(ksceKernelGetSystemTimeWide() / 1000),
-		     probe_hook_uid[0], probe_hook_uid[1], probe_hook_uid[2],
-		     probe_hook_uid[3], probe_hook_uid[4], probe_hook_uid[5],
-		     probe_hook_uid[6]);
+	_Static_assert(sizeof(fns) / sizeof(fns[0]) == PROBE_HOOKS,
+		       "one hook function per probe_hooks entry");
+	n = snprintf(line, sizeof(line), "%8u probe build 114\n",
+		     (unsigned int)(ksceKernelGetSystemTimeWide() / 1000));
 	probe_write(line, n, 1);
-
-	probe_run = 1;
-	probe_thread_id = ksceKernelCreateThread("vitasync_probe", probe_thread,
-						 0x40, 0x2000, 0, 0x10000, 0);
-	if (probe_thread_id >= 0)
-		ksceKernelStartThread(probe_thread_id, 0, NULL);
+	for (i = 0; i < PROBE_HOOKS; i++) {
+		probe_hook_uid[i] = taiHookFunctionExportForKernel(KERNEL_PID,
+			&probe_ref[i], probe_hooks[i].module, probe_hooks[i].lib,
+			probe_hooks[i].nid, fns[i]);
+		n = snprintf(line, sizeof(line), "         hook %s: 0x%08X\n",
+			     probe_hooks[i].name, probe_hook_uid[i]);
+		probe_write(line, n, 0);
+	}
 }
 
 static void probe_remove(void)
 {
-	int i;
+	unsigned int i;
 
-	if (probe_thread_id >= 0) {
-		probe_run = 0;
-		ksceKernelWaitThreadEnd(probe_thread_id, NULL, NULL);
-		ksceKernelDeleteThread(probe_thread_id);
-		probe_thread_id = -1;
-	}
 	for (i = 0; i < PROBE_HOOKS; i++)
 		if (probe_hook_uid[i] > 0)
 			taiHookReleaseForKernel(probe_hook_uid[i], probe_ref[i]);
@@ -2183,23 +2074,30 @@ static int usb_retake(void)
 	       sizeof(uvc_probe_control_setting));
 
 	DLOG("retaking USB\n");
+	PROBE("  retake: taking USB back");
 	/* Our requests may go out again (the attach that follows arms the
 	 * HID receive). */
 	usb_yielded = 0;
 	ret = usb_takeover();
 	if (ret < 0) {
 		DLOG("retake failed (0x%08X), giving USB back to MTP\n", ret);
+		PROBE("  retake failed 0x%08X", ret);
 		usb_yielded = 1;
 		usb_restore_mtp();
 	} else {
 		DLOG("retake OK\n");
+		PROBE("  retake OK");
 	}
 	DFLUSH_SAFE();
 	return ret;
 }
 
 #define USB_CHECK_INTERVAL_US	1000000	/* driver states read once a second */
-#define USB_FREE_CHECKS		2	/* checks in a row before retaking */
+/* Checks in a row (one a second) before retaking. VitaShell restarts MTP
+ * in the middle of closing USB transfer, then still unloads its module and
+ * re-reads the memory card. Retaking 1.5 s after MTP came back (2 checks,
+ * builds 95-112) came while that was going on; 5 leaves it the time. */
+#define USB_FREE_CHECKS		5
 #define USB_RETAKE_MAX_FAILS	3	/* then stop trying until next load */
 
 static int uvc_thread(SceSize args, void *argp)
@@ -2309,6 +2207,24 @@ static int uvc_thread(SceSize args, void *argp)
 					     ours, mtp, dbg_running_seen,
 					     dbg_drv_start_n, dbg_drv_stop_n);
 					DFLUSH_SAFE();
+				}
+			}
+#endif
+#ifdef USB_PROBE
+			{
+				static int seen_ours = -1, seen_mtp = -1, seen_run = -1;
+				int ours = ksceUdcdGetDrvState(UVC_DRIVER_NAME);
+				int mtp = ksceUdcdGetDrvState("USB_MTP_Driver");
+
+				if (ours != seen_ours || mtp != seen_mtp ||
+				    usb_driver_running != seen_run) {
+					seen_ours = ours;
+					seen_mtp = mtp;
+					seen_run = usb_driver_running;
+					PROBE("  retake check: VITASYNC 0x%08X (ref 0x%08X), "
+					      "MTP 0x%08X (ref 0x%08X), free checks %d",
+					      ours, usb_ours_running_state, mtp,
+					      usb_mtp_stopped_state, usb_free_checks);
 				}
 			}
 #endif

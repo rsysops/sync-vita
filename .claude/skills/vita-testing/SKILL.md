@@ -49,12 +49,16 @@ with sync-vita, then **6** connected again? and **7** bring the results back.
 - A `.vpk` copied to `downloads/` is installed from VitaShell (✕ on it).
 - **sync-vita:** `$VITACTL --help` lists the commands. The Vita running the
   VitaSync plugin shows as `054c:1337`. Closing VitaShell's USB transfer
-  (CIRCLE) gives USB back to the plugin within seconds. The plugin can press
-  PS (build 90+).
-- **USB transfer freeze:** once `$VITACTL` has sent input or run `status` in
-  a boot, opening USB transfer can freeze the Vita, which crashes 30–60 s
-  later (sync-vita's `TODO.md`). In such a boot, use **FTP only**, unless the
-  Vita has been rebooted since.
+  (CIRCLE) gives USB back to the plugin about 5 s later. The plugin can press
+  PS (build 90+). After `$VITACTL watch stop`, input is lost until the next
+  `watch start` or USB transfer: send input before stopping the video.
+- **USB transfer freeze:** with plugin build 110 or older (`$VITACTL status`
+  shows the build), opening USB transfer after the video or input was used in
+  that boot freezes the Vita until it's forced off (sync-vita's `TODO.md`).
+  In such a boot, use **FTP only**, unless the Vita has been rebooted since.
+  From build 111 USB transfer works then; rarely, VitaShell hangs ~30 s (PS
+  frees it), and after a hang while closing, the Vita hasn't re-read `ux0:`:
+  have it rebooted before anything is written to `ux0:`.
 
 ## 0. Project facts
 
@@ -90,8 +94,8 @@ ls "$MOUNT/"                                # USB: expect app/ data/ VitaShell/ 
 curl -sS --connect-timeout 5 "$FTP/ux0:/"   # FTP: lists the card's folders
 ```
 
-- If `$VITACTL` has sent input or run `status` in this boot, only FTP
-  counts (freeze).
+- With plugin build 110 or older, if `$VITACTL` has sent input or run
+  `status` in this boot, only FTP counts (freeze).
 - If neither answers, ask the user to open VitaDeploy > File Manager and
   either press
   SELECT (USB) and plug the Vita in, or start its FTP server (same network
@@ -201,8 +205,8 @@ Tell the user, in a few numbered lines:
    `$VITACTL record SECONDS "$DEST/<what>.mkv" [--before S]` (in the
    background, `&`, while `run` plays the inputs), then `$VITACTL analyze`
    on it, and look at the pictures it flags rather than at every frame.
-5. **When done:** quit the app (`press PS`, then close it if needed). From
-   now on this boot is **FTP only** (freeze). Open VitaDeploy from LiveArea
+5. **When done:** quit the app (`press PS`, then close it if needed). With
+   plugin build 110 or older, this boot is now **FTP only** (freeze). Open VitaDeploy from LiveArea
    (find its bubble in a shot, `touch` it, start it), choose **File
    Manager**, then start its FTP server ("Setting SELECT to FTP", then SELECT). Check in
    a shot that its dialog shows `$VITA_IP` (say so if it doesn't), then
@@ -211,8 +215,8 @@ Tell the user, in a few numbered lines:
 
 ## 6. Connected again?
 
-Run step 1's check again, with the same rule: after `$VITACTL` input or
-`status` in this boot, FTP only. If it fails, ask for USB mode or the FTP
+Run step 1's check again, with the same rule: with plugin build 110 or
+older, after `$VITACTL` input or `status` in this boot, FTP only. If it fails, ask for USB mode or the FTP
 server again, in VitaDeploy > File Manager (for FTP: check its dialog's address, and that the Vita
 and the PC are on the same network).
 
@@ -290,8 +294,9 @@ passes.
 - Delete nothing on the Vita but the results moved in step 7, and only
   once each one has been copied. Never touch what the project file lists
   under **Never touched**.
-- Never ask for USB transfer in a boot where `$VITACTL` has sent input or
-  run `status`; use FTP or have the Vita rebooted first.
+- With plugin build 110 or older, never ask for USB transfer in a boot where
+  `$VITACTL` has sent input or run `status`; use FTP or have the Vita
+  rebooted first.
 - Never press SELECT without first checking in VitaShell's settings that it
   opens FTP ("Setting SELECT to FTP"): it might open USB transfer.
 - While FTP runs in the background, PS is locked; close FTP before anything
